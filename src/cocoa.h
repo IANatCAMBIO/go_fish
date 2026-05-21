@@ -5,16 +5,17 @@
 // One window's metadata, returned by gf_enumerateWindows.
 // All pointer/string fields are owned by the caller and must be freed:
 //   - title, appName: free()
-//   - axRef: gf_release()
+//   - axRef: gf_release() (NULL is allowed for unresponsive-app placeholders)
 typedef struct {
     int          pid;
-    void        *axRef;     // AXUIElementRef, retained (+1)
-    unsigned int windowID;  // CGWindowID, 0 if unknown
-    char        *title;     // strdup'd
-    char        *appName;   // strdup'd
-    int          minimized; // 0 / 1
-    int          onScreen;  // 0 / 1
-    int          zOrder;    // smaller = closer to front
+    void        *axRef;       // AXUIElementRef, retained (+1); NULL if unresponsive
+    unsigned int windowID;    // CGWindowID, 0 if unknown
+    char        *title;       // strdup'd
+    char        *appName;     // strdup'd
+    int          minimized;   // 0 / 1
+    int          onScreen;    // 0 / 1
+    int          zOrder;      // smaller = closer to front
+    int          unresponsive;// 0 / 1; if 1, axRef is NULL and entry is a per-app placeholder
 } gf_window_t;
 
 // Permissions.
@@ -35,16 +36,29 @@ void         gf_release(void *axRef);
 // PID of the current frontmost application, or 0 if none.
 int          gf_frontmostPID(void);
 
-// Panel data builder. gf_showPanel takes ownership and frees it.
+// Panel data builder. gf_showPanel / gf_updatePanelEntries take ownership and free it.
 void *gf_newPanelData(int count);
 void  gf_setPanelEntry(void *data, int idx,
                        const char *title, const char *appName,
                        void *axRef, unsigned int windowID,
-                       int minimized, int pid);
+                       int minimized, int pid, int unresponsive);
 void  gf_showPanel(void *data, int selected);
+// In-place entry refresh without resizing/recentering the panel. Used after
+// closing a window so the grid updates without a visible jump.
+void  gf_updatePanelEntries(void *data, int selected);
 void  gf_updateSelection(int selected);
 void  gf_hidePanel(void);
 
 // Activation. Brings window + app forward; if on another Space, the system
 // switches Spaces as a side-effect of activating the app.
 void gf_activateWindow(void *axRef, int pid, int minimized);
+
+// Close. Presses the target window's AX close button. Caller retains ownership
+// of axRef (this function does not release it).
+void gf_closeWindow(void *axRef);
+
+// Bulk window arrangement, driven by the menu-bar status item.
+// Both operate on every standard window of every regular app (same filter
+// gf_enumerateWindows uses).
+void gf_minimizeAll(void);
+void gf_cascadeAll(void);

@@ -13,11 +13,17 @@ the same app.
   two most recent windows
 - **Keyboard + mouse** — Tab / Shift+Tab to cycle, hover to select,
   click to commit
+- **Per-tile metadata** — app name above the thumbnail, window title
+  below, and an **X** button to close the window without leaving the grid
 - **Includes minimized windows** (shown with the app icon); selecting one
   restores it
+- **Resilient to unresponsive apps** — apps that don't respond within
+  100 ms still appear in the grid as a placeholder with a "not responding"
+  badge, so a hung app can't stall the switcher
 - **Space-aware** — activating a window on another Space switches Spaces
   automatically
-- **Menu-bar entry** with show-grid and quit options
+- **Menu-bar entry** with Show Window Grid, Minimize All, Cascade All,
+  and Quit
 - **Thumbnail caching** so the grid opens instantly for recently-focused
   windows
 - **Auto-sized panel** that adapts to the number of open windows
@@ -76,7 +82,10 @@ CoreGraphics:
 - **Hotkey capture** — a global `CGEventTap` intercepts Cmd+Tab and
   Cmd+\` before they reach the focused app
 - **Window enumeration** — `kAXWindowsAttribute` per running app,
-  snapshotted on demand (no background polling)
+  snapshotted on demand (no background polling). A 100 ms per-app
+  `AXUIElementSetMessagingTimeout` guards against unresponsive processes
+  stalling the snapshot; the offending app appears as a placeholder
+  instead.
 - **MRU tracking** — fed by
   `NSWorkspaceDidActivateApplicationNotification` plus per-app
   `AXObserver` callbacks on focused-window changes

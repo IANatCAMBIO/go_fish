@@ -39,6 +39,7 @@ extern int  gfOnHotkey(int shift, int scope);
 extern int  gfOnCommit(void);
 extern int  gfOnCancel(void);
 extern void gfSetSelection(int idx);
+extern int  gfOnClose(int idx);
 
 // =========================================================================
 // State (main thread only, unless noted).
@@ -160,10 +161,24 @@ int gf_frontmostPID(void) {
     return app ? (int)app.processIdentifier : 0;
 }
 
+// Per-app AX messaging timeout. Keeps a single unresponsive app from stalling
+// the entire window snapshot. The app still appears in the grid as a
+// placeholder entry (unresponsive=1, axRef=NULL).
+static const float kAXAppTimeout = 0.1f; // seconds
+
+static void gf_ensureCap(gf_window_t **buf, int *cap, int needed) {
+    if (needed <= *cap) return;
+    int newCap = *cap > 0 ? *cap : 32;
+    while (newCap < needed) newCap *= 2;
+    *buf = (gf_window_t *)realloc(*buf, newCap * sizeof(gf_window_t));
+    memset(*buf + *cap, 0, (newCap - *cap) * sizeof(gf_window_t));
+    *cap = newCap;
+}
+
 gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
     *out_count = 0;
     @autoreleasepool {
-        // First, build a CGWindowID -> front-to-back-index map for sort + on-screen test.
+        // CGWindowID -> front-to-back-index map for sort + on-screen test.
         NSMutableDictionary<NSNumber *, NSNumber *> *cgIndex = [NSMutableDictionary dictionary];
         CFArrayRef cgList = CGWindowListCopyWindowInfo(
             kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
@@ -180,7 +195,11 @@ gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
             CFRelease(cgList);
         }
 
-        NSMutableArray *result = [NSMutableArray array];
+        // Grow a single C buffer directly — no NSDictionary intermediate.
+        int cap = 0, count = 0;
+        gf_window_t *out = NULL;
+        gf_ensureCap(&out, &cap, 32);
+
         int fallbackZ = 0;
         NSArray<NSRunningApplication *> *apps = [[NSWorkspace sharedWorkspace] runningApplications];
         for (NSRunningApplication *app in apps) {
@@ -192,8 +211,39 @@ gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
             }
             AXUIElementRef axApp = AXUIElementCreateApplication(pid);
             if (!axApp) continue;
+
+            // Cap AX messaging time on this app so an unresponsive process
+            // can't stall the panel. The same timeout propagates to child
+            // window elements queried through axApp.
+            AXUIElementSetMessagingTimeout(axApp, kAXAppTimeout);
+
             CFArrayRef axWins = NULL;
-            AXError err = AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute, (CFTypeRef *)&axWins);
+            AXError err = AXUIElementCopyAttributeValue(
+                axApp, kAXWindowsAttribute, (CFTypeRef *)&axWins);
+
+            if (err == kAXErrorCannotComplete) {
+                // App didn't respond in time. Add a single placeholder so the
+                // user can still see and (best-effort) activate it.
+                if (app.localizedName.length == 0) {
+                    CFRelease(axApp);
+                    continue;
+                }
+                gf_ensureCap(&out, &cap, count + 1);
+                gf_window_t *e = &out[count];
+                e->pid          = (int)pid;
+                e->axRef        = NULL;
+                e->windowID     = 0;
+                e->title        = strdup([app.localizedName UTF8String]);
+                e->appName      = strdup([app.localizedName UTF8String]);
+                e->minimized    = 0;
+                e->onScreen     = 1;
+                e->zOrder       = 900000 + fallbackZ;
+                e->unresponsive = 1;
+                count++;
+                fallbackZ++;
+                CFRelease(axApp);
+                continue;
+            }
             if (err != kAXErrorSuccess || !axWins) {
                 CFRelease(axApp);
                 continue;
@@ -214,8 +264,6 @@ gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
                 }
 
                 if (!minimized) {
-                    // Subrole filter (visible windows only): keep standard
-                    // windows, drop palettes / dialogs / tooltips.
                     CFTypeRef subroleRef = NULL;
                     AXUIElementCopyAttributeValue(w, kAXSubroleAttribute, &subroleRef);
                     NSString *subrole = (__bridge_transfer NSString *)subroleRef;
@@ -234,56 +282,46 @@ gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
                 BOOL onScreen = (order != nil) && !minimized;
 
                 // Sort key: MRU position first, then z-order, then minimized.
-                // Lower = closer to front of the switcher.
                 NSInteger mruPos = (winID && gMRU) ? [gMRU indexOfObject:@(winID)] : NSNotFound;
                 int zOrder;
                 if (mruPos != NSNotFound) {
-                    zOrder = (int)mruPos;                  // 0..kMRUCap
+                    zOrder = (int)mruPos;
                 } else if (order) {
-                    zOrder = 100000 + order.intValue;      // visible but never touched
+                    zOrder = 100000 + order.intValue;
                 } else if (minimized) {
-                    zOrder = 300000 + fallbackZ;           // minimized, unknown to MRU
+                    zOrder = 300000 + fallbackZ;
                 } else {
-                    zOrder = 200000 + fallbackZ;           // off-Space, unknown to MRU
+                    zOrder = 200000 + fallbackZ;
                 }
                 fallbackZ++;
 
-                // Skip windows with no title AND no app name — usually noise.
                 if (title.length == 0 && app.localizedName.length == 0) continue;
 
                 NSString *displayTitle = title.length > 0 ? title : app.localizedName;
                 NSString *displayApp   = app.localizedName ?: @"";
 
-                NSValue *axBoxed = [NSValue valueWithPointer:(const void *)CFRetain(w)];
-                [result addObject:@{
-                    @"title":     displayTitle,
-                    @"appName":   displayApp,
-                    @"axRef":     axBoxed,
-                    @"windowID":  @(winID),
-                    @"minimized": @(minimized),
-                    @"onScreen":  @(onScreen),
-                    @"zOrder":    @(zOrder),
-                    @"pid":       @((int)pid),
-                }];
+                gf_ensureCap(&out, &cap, count + 1);
+                gf_window_t *e = &out[count];
+                e->pid          = (int)pid;
+                e->axRef        = (void *)CFRetain(w);
+                e->windowID     = winID;
+                e->title        = strdup([displayTitle UTF8String]);
+                e->appName      = strdup([displayApp UTF8String]);
+                e->minimized    = minimized ? 1 : 0;
+                e->onScreen     = onScreen ? 1 : 0;
+                e->zOrder       = zOrder;
+                e->unresponsive = 0;
+                count++;
             }
             CFRelease(axWins);
             CFRelease(axApp);
         }
 
-        if (result.count == 0) return NULL;
-        gf_window_t *out = calloc(result.count, sizeof(gf_window_t));
-        for (NSUInteger i = 0; i < result.count; i++) {
-            NSDictionary *e = result[i];
-            out[i].pid       = [e[@"pid"] intValue];
-            out[i].axRef     = [e[@"axRef"] pointerValue]; // retained
-            out[i].windowID  = [e[@"windowID"] unsignedIntValue];
-            out[i].title     = strdup([e[@"title"] UTF8String]);
-            out[i].appName   = strdup([e[@"appName"] UTF8String]);
-            out[i].minimized = [e[@"minimized"] intValue];
-            out[i].onScreen  = [e[@"onScreen"] intValue];
-            out[i].zOrder    = [e[@"zOrder"] intValue];
+        if (count == 0) {
+            free(out);
+            return NULL;
         }
-        *out_count = (int)result.count;
+        *out_count = count;
         return out;
     }
 }
@@ -304,6 +342,7 @@ void gf_release(void *axRef) {
 @property (nonatomic, assign) int pid;
 @property (nonatomic, assign) BOOL minimized;
 @property (nonatomic, assign) BOOL thumbLoaded;
+@property (nonatomic, assign) BOOL unresponsive;
 @end
 @implementation GFEntry @end
 
@@ -311,11 +350,14 @@ void gf_release(void *axRef) {
 @property (nonatomic, assign) NSInteger selected;
 @property (nonatomic, strong) NSArray<GFEntry *> *entries;
 @property (nonatomic, strong) NSTrackingArea *trackingArea;
+- (void)updateSelection:(NSInteger)idx;
 @end
 
 // Layout values. Kept as a single struct so drawing and hit-testing agree.
+// appH is the band above the thumbnail that holds the application name;
+// titleH is the band below the thumbnail that holds the window title.
 typedef struct {
-    CGFloat margin, gap, titleH;
+    CGFloat margin, gap, titleH, appH;
     NSInteger cols;
     CGFloat tileW, tileH, cellH;
     CGFloat topY;
@@ -336,10 +378,10 @@ static NSInteger gf_pickCols(NSInteger n) {
 // clamping to screen bounds if the result is too large.
 static NSSize gf_preferredPanelSize(NSInteger n) {
     if (n < 1) n = 1;
-    CGFloat margin = 24, gap = 14, titleH = 22;
+    CGFloat margin = 24, gap = 14, titleH = 22, appH = 20;
     CGFloat tileW = 240;
     CGFloat tileH = tileW * 0.65;
-    CGFloat cellH = tileH + titleH + 4;
+    CGFloat cellH = tileH + titleH + appH + 4;
     NSInteger cols = gf_pickCols(n);
     NSInteger rows = (n + cols - 1) / cols;
     CGFloat w = 2*margin + cols*tileW + (cols-1)*gap;
@@ -358,6 +400,7 @@ static NSSize gf_preferredPanelSize(NSInteger n) {
     L.margin = 24;
     L.gap = 14;
     L.titleH = 22;
+    L.appH = 20;
     L.cols = gf_pickCols(n);
     NSInteger rows = (n + L.cols - 1) / L.cols;
 
@@ -368,11 +411,11 @@ static NSSize gf_preferredPanelSize(NSInteger n) {
     // nothing clips off the bottom of a clamped panel. tileH = tileW * 0.65.
     CGFloat tileWByWidth  = (availW - L.gap*(L.cols-1)) / L.cols;
     CGFloat innerCellH    = (availH - L.gap*(rows-1)) / rows;
-    CGFloat tileWByHeight = (innerCellH - L.titleH - 4) / 0.65;
+    CGFloat tileWByHeight = (innerCellH - L.titleH - L.appH - 4) / 0.65;
     L.tileW = MIN(tileWByWidth, tileWByHeight);
     if (L.tileW < 60) L.tileW = 60;
     L.tileH = L.tileW * 0.65;
-    L.cellH = L.tileH + L.titleH + 4;
+    L.cellH = L.tileH + L.titleH + L.appH + 4;
 
     CGFloat totalH = rows*L.cellH + (rows-1)*L.gap;
     L.topY = b.size.height/2 + totalH/2;
@@ -392,17 +435,83 @@ static NSSize gf_preferredPanelSize(NSInteger n) {
 - (NSRect)cellRectForIndex:(NSInteger)i layout:(gf_layout_t)L {
     NSRect r = [self imageRectForIndex:i layout:L];
     return NSMakeRect(r.origin.x, r.origin.y - L.titleH - 2,
-                      r.size.width, r.size.height + L.titleH + 2);
+                      r.size.width, r.size.height + L.titleH + L.appH + 4);
+}
+
+// Close-button rect for tile i, vertically centered in the app-name band so it
+// sits to the left of the app name without overlapping the thumbnail itself.
+- (NSRect)closeRectForIndex:(NSInteger)i layout:(gf_layout_t)L {
+    NSRect r = [self imageRectForIndex:i layout:L];
+    CGFloat d = MIN(16.0, L.appH - 4.0);
+    if (d < 10.0) d = 10.0;
+    CGFloat bandY = NSMaxY(r) + 2;             // bottom of the app-name band
+    CGFloat y     = bandY + (L.appH - d) / 2;  // center vertically in the band
+    return NSMakeRect(NSMinX(r), y, d, d);
+}
+
+- (NSInteger)indexAtPoint:(NSPoint)p layout:(gf_layout_t)L {
+    NSInteger n = self.entries.count;
+    for (NSInteger i = 0; i < n; i++) {
+        if (NSPointInRect(p, [self cellRectForIndex:i layout:L])) return i;
+    }
+    return -1;
 }
 
 - (NSInteger)indexAtPoint:(NSPoint)p {
     NSInteger n = self.entries.count;
     if (n == 0) return -1;
+    return [self indexAtPoint:p layout:[self layoutForCount:n]];
+}
+
+// Dirty just the previous-selected and new-selected cells (plus highlight
+// outset) instead of the whole panel. Cuts hover-driven CPU significantly.
+- (void)updateSelection:(NSInteger)idx {
+    NSInteger prev = self.selected;
+    if (prev == idx) return;
+    self.selected = idx;
+    NSInteger n = self.entries.count;
+    if (n == 0) return;
     gf_layout_t L = [self layoutForCount:n];
-    for (NSInteger i = 0; i < n; i++) {
-        if (NSPointInRect(p, [self cellRectForIndex:i layout:L])) return i;
+    if (prev >= 0 && prev < n) {
+        [self setNeedsDisplayInRect:
+            NSInsetRect([self cellRectForIndex:prev layout:L], -6, -6)];
     }
-    return -1;
+    if (idx >= 0 && idx < n) {
+        [self setNeedsDisplayInRect:
+            NSInsetRect([self cellRectForIndex:idx layout:L], -6, -6)];
+    }
+}
+
+// Cached drawing attributes — these dictionaries are immutable and used on
+// every draw, so allocating them per frame (with mouseMoved hammering
+// drawRect:) wastes a lot of autoreleased objects.
+static NSDictionary *gTitleAttrs    = nil;
+static NSDictionary *gAppAttrs      = nil;
+static NSDictionary *gBadgeAttrs    = nil;
+static NSDictionary *gWarnAttrs     = nil;
+static void gf_initDrawAttrs(void) {
+    if (gTitleAttrs) return;
+    NSMutableParagraphStyle *para = [NSMutableParagraphStyle new];
+    para.lineBreakMode = NSLineBreakByTruncatingTail;
+    para.alignment = NSTextAlignmentCenter;
+    gTitleAttrs = @{
+        NSFontAttributeName:            [NSFont systemFontOfSize:12],
+        NSForegroundColorAttributeName: [NSColor labelColor],
+        NSParagraphStyleAttributeName:  para,
+    };
+    gAppAttrs = @{
+        NSFontAttributeName:            [NSFont boldSystemFontOfSize:11],
+        NSForegroundColorAttributeName: [NSColor secondaryLabelColor],
+        NSParagraphStyleAttributeName:  para,
+    };
+    gBadgeAttrs = @{
+        NSFontAttributeName:            [NSFont boldSystemFontOfSize:10],
+        NSForegroundColorAttributeName: [NSColor secondaryLabelColor],
+    };
+    gWarnAttrs = @{
+        NSFontAttributeName:            [NSFont boldSystemFontOfSize:10],
+        NSForegroundColorAttributeName: [NSColor systemRedColor],
+    };
 }
 
 - (void)drawRect:(NSRect)dirty {
@@ -414,42 +523,41 @@ static NSSize gf_preferredPanelSize(NSInteger n) {
     NSInteger n = self.entries.count;
     if (n == 0) return;
     gf_layout_t L = [self layoutForCount:n];
-
-    NSMutableParagraphStyle *para = [NSMutableParagraphStyle new];
-    para.lineBreakMode = NSLineBreakByTruncatingTail;
-    para.alignment = NSTextAlignmentCenter;
-    NSDictionary *titleAttrs = @{
-        NSFontAttributeName:            [NSFont systemFontOfSize:12],
-        NSForegroundColorAttributeName: [NSColor labelColor],
-        NSParagraphStyleAttributeName:  para,
-    };
+    gf_initDrawAttrs();
 
     for (NSInteger i = 0; i < n; i++) {
-        NSRect imgR  = [self imageRectForIndex:i layout:L];
-        NSRect textR = NSMakeRect(imgR.origin.x, imgR.origin.y - L.titleH - 2,
-                                  imgR.size.width, L.titleH);
+        // Skip cells outside the dirty rect. Combined with cell-scoped dirty
+        // marking in updateSelection:, this keeps mouseMoved redraws cheap.
+        NSRect outsetCell = NSInsetRect([self cellRectForIndex:i layout:L], -6, -6);
+        if (!NSIntersectsRect(outsetCell, dirty)) continue;
+
+        NSRect imgR   = [self imageRectForIndex:i layout:L];
+        NSRect closeR = [self closeRectForIndex:i layout:L];
+        NSRect textR  = NSMakeRect(imgR.origin.x, imgR.origin.y - L.titleH - 2,
+                                   imgR.size.width, L.titleH);
+        CGFloat appPad = closeR.size.width + 4;
+        CGFloat appW   = imgR.size.width - 2 * appPad;
+        if (appW < 0) appW = 0;
+        NSRect appR  = NSMakeRect(imgR.origin.x + appPad,
+                                  imgR.origin.y + imgR.size.height + 2,
+                                  appW, L.appH);
+
+        GFEntry *e = self.entries[i];
 
         if (i == self.selected) {
-            NSRect hi = NSInsetRect(imgR, -6, -6);
-            hi.size.height += L.titleH + 8;
-            hi.origin.y -= L.titleH + 2;
+            NSRect hi = NSInsetRect([self cellRectForIndex:i layout:L], -6, -6);
             NSBezierPath *h = [NSBezierPath bezierPathWithRoundedRect:hi xRadius:10 yRadius:10];
             [[[NSColor controlAccentColor] colorWithAlphaComponent:0.55] setFill];
             [h fill];
         }
 
-        GFEntry *e = self.entries[i];
         if (e.image) {
             NSSize is = e.image.size;
             NSSize ds;
             if (e.thumbLoaded) {
-                // Live thumbnail: scale to fit the tile.
                 CGFloat scale = MIN(imgR.size.width/is.width, imgR.size.height/is.height);
                 ds = NSMakeSize(is.width*scale, is.height*scale);
             } else {
-                // App icon (minimized window, or not-yet-captured). NSImage
-                // picks the right rep when we ask for 64x64. Shrink if the
-                // tile is tighter than that.
                 CGFloat side = MIN(64.0, MIN(imgR.size.width, imgR.size.height) - 8);
                 if (side < 16) side = 16;
                 ds = NSMakeSize(side, side);
@@ -458,19 +566,41 @@ static NSSize gf_preferredPanelSize(NSInteger n) {
                                    imgR.origin.y + (imgR.size.height - ds.height)/2,
                                    ds.width, ds.height);
             [e.image drawInRect:dr fromRect:NSZeroRect
-                      operation:NSCompositingOperationSourceOver fraction:1.0];
-            if (e.minimized) {
-                NSDictionary *bAttrs = @{
-                    NSFontAttributeName: [NSFont boldSystemFontOfSize:10],
-                    NSForegroundColorAttributeName: [NSColor secondaryLabelColor],
-                };
-                [@"minimized" drawAtPoint:NSMakePoint(imgR.origin.x+4, imgR.origin.y+4)
-                           withAttributes:bAttrs];
+                      operation:NSCompositingOperationSourceOver fraction:e.unresponsive ? 0.7 : 1.0];
+            if (e.unresponsive) {
+                [@"not responding"
+                    drawAtPoint:NSMakePoint(imgR.origin.x+4, imgR.origin.y+4)
+                 withAttributes:gWarnAttrs];
+            } else if (e.minimized) {
+                [@"minimized"
+                    drawAtPoint:NSMakePoint(imgR.origin.x+4, imgR.origin.y+4)
+                 withAttributes:gBadgeAttrs];
             }
         }
 
         NSString *label = e.title.length > 0 ? e.title : e.appName;
-        [label drawInRect:textR withAttributes:titleAttrs];
+        [label drawInRect:textR withAttributes:gTitleAttrs];
+        if (e.appName.length > 0) {
+            [e.appName drawInRect:appR withAttributes:gAppAttrs];
+        }
+
+        // Close button: only drawn for entries we can actually close (i.e.
+        // not unresponsive placeholders, which have no AX ref).
+        if (!e.unresponsive) {
+            NSBezierPath *circle = [NSBezierPath bezierPathWithOvalInRect:closeR];
+            [[NSColor colorWithWhite:0.0 alpha:0.60] setFill];
+            [circle fill];
+            [[NSColor colorWithWhite:1.0 alpha:0.95] setStroke];
+            NSBezierPath *cross = [NSBezierPath bezierPath];
+            cross.lineWidth = 1.5;
+            cross.lineCapStyle = NSLineCapStyleRound;
+            CGFloat pad = closeR.size.width * 0.30;
+            [cross moveToPoint:NSMakePoint(NSMinX(closeR) + pad, NSMinY(closeR) + pad)];
+            [cross lineToPoint:NSMakePoint(NSMaxX(closeR) - pad, NSMaxY(closeR) - pad)];
+            [cross moveToPoint:NSMakePoint(NSMaxX(closeR) - pad, NSMinY(closeR) + pad)];
+            [cross lineToPoint:NSMakePoint(NSMinX(closeR) + pad, NSMaxY(closeR) - pad)];
+            [cross stroke];
+        }
     }
 }
 
@@ -499,7 +629,20 @@ static NSSize gf_preferredPanelSize(NSInteger n) {
 
 - (void)mouseDown:(NSEvent *)e {
     NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
-    NSInteger idx = [self indexAtPoint:p];
+    NSInteger n = self.entries.count;
+    if (n == 0) return;
+    gf_layout_t L = [self layoutForCount:n];
+    // Close-button hit-test first, but only for entries that actually draw an
+    // X — unresponsive placeholders skip both the draw and the hit-test.
+    for (NSInteger i = 0; i < n; i++) {
+        GFEntry *ge = self.entries[i];
+        if (ge.unresponsive) continue;
+        if (NSPointInRect(p, [self closeRectForIndex:i layout:L])) {
+            gfOnClose((int)i);
+            return;
+        }
+    }
+    NSInteger idx = [self indexAtPoint:p layout:L];
     if (idx < 0) return;
     gfSetSelection((int)idx);
     gfOnCommit();
@@ -540,10 +683,11 @@ static void ensurePanel(void) {
 typedef struct {
     char         *title;
     char         *appName;
-    void         *axRef;     // not retained here (Go owns)
+    void         *axRef;       // not retained here (Go owns); NULL if unresponsive
     unsigned int  windowID;
     int           minimized;
     int           pid;
+    int           unresponsive;
 } gf_pe_t;
 typedef struct {
     gf_pe_t *entries;
@@ -560,14 +704,15 @@ void *gf_newPanelData(int count) {
 void gf_setPanelEntry(void *data, int idx,
                       const char *title, const char *appName,
                       void *axRef, unsigned int windowID,
-                      int minimized, int pid) {
+                      int minimized, int pid, int unresponsive) {
     gf_pd_t *d = (gf_pd_t *)data;
-    d->entries[idx].title     = strdup(title ?: "");
-    d->entries[idx].appName   = strdup(appName ?: "");
-    d->entries[idx].axRef     = axRef;
-    d->entries[idx].windowID  = windowID;
-    d->entries[idx].minimized = minimized;
-    d->entries[idx].pid       = pid;
+    d->entries[idx].title        = strdup(title ?: "");
+    d->entries[idx].appName      = strdup(appName ?: "");
+    d->entries[idx].axRef        = axRef;
+    d->entries[idx].windowID     = windowID;
+    d->entries[idx].minimized    = minimized;
+    d->entries[idx].pid          = pid;
+    d->entries[idx].unresponsive = unresponsive;
 }
 
 static void freePanelData(gf_pd_t *d) {
@@ -580,44 +725,68 @@ static void freePanelData(gf_pd_t *d) {
     free(d);
 }
 
+// Main-thread only. Build GFEntry objects from panel data, populating thumbs
+// from the cache when present and falling back to the app icon otherwise.
+static NSArray<GFEntry *> *gf_buildEntries(gf_pd_t *d) {
+    NSMutableArray<GFEntry *> *items = [NSMutableArray arrayWithCapacity:d->count];
+    for (int i = 0; i < d->count; i++) {
+        gf_pe_t *e = &d->entries[i];
+        GFEntry *ge = [GFEntry new];
+        ge.title        = [NSString stringWithUTF8String:e->title];
+        ge.appName      = [NSString stringWithUTF8String:e->appName];
+        ge.windowID     = e->windowID;
+        ge.pid          = e->pid;
+        ge.minimized    = e->minimized != 0;
+        ge.unresponsive = e->unresponsive != 0;
+
+        NSImage *cached = nil;
+        if (!ge.minimized && e->windowID != 0) {
+            cached = gThumbCache[@(e->windowID)];
+        }
+        if (cached) {
+            ge.image      = cached;
+            ge.thumbLoaded = YES;
+            NSNumber *key = @(e->windowID);
+            [gThumbLRU removeObject:key];
+            [gThumbLRU addObject:key];
+        } else {
+            NSRunningApplication *app = [NSRunningApplication
+                runningApplicationWithProcessIdentifier:(pid_t)e->pid];
+            ge.image = app.icon;
+        }
+        [items addObject:ge];
+    }
+    return items;
+}
+
+// Main-thread only. Kick off background thumbnail refresh for any cache
+// misses or stale entries. Each completion path updates the live panel.
+static void gf_fireCaptureRefresh(NSArray<GFEntry *> *items) {
+    NSDate *now = [NSDate date];
+    for (GFEntry *e in items) {
+        if (e.minimized || e.windowID == 0 || e.unresponsive) continue;
+        if (!e.thumbLoaded) {
+            gf_captureAsync(e.windowID);
+            continue;
+        }
+        NSDate *age = gThumbAge[@(e.windowID)];
+        if (!age || [now timeIntervalSinceDate:age] > kThumbStaleAfter) {
+            gf_captureAsync(e.windowID);
+        }
+    }
+}
+
 void gf_showPanel(void *data, int selected) {
     gf_pd_t *d = (gf_pd_t *)data;
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             ensurePanel();
 
-            NSMutableArray<GFEntry *> *items = [NSMutableArray arrayWithCapacity:d->count];
-            for (int i = 0; i < d->count; i++) {
-                gf_pe_t *e = &d->entries[i];
-                GFEntry *ge = [GFEntry new];
-                ge.title    = [NSString stringWithUTF8String:e->title];
-                ge.appName  = [NSString stringWithUTF8String:e->appName];
-                ge.windowID = e->windowID;
-                ge.pid      = e->pid;
-                ge.minimized = e->minimized != 0;
-
-                // Cache hit? Display instantly without any background work.
-                NSImage *cached = nil;
-                if (!ge.minimized && e->windowID != 0) {
-                    cached = gThumbCache[@(e->windowID)];
-                }
-                if (cached) {
-                    ge.image = cached;
-                    ge.thumbLoaded = YES;
-                    // Bump LRU (this counts as a use).
-                    NSNumber *key = @(e->windowID);
-                    [gThumbLRU removeObject:key];
-                    [gThumbLRU addObject:key];
-                } else {
-                    NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:(pid_t)e->pid];
-                    ge.image = app.icon;
-                }
-                [items addObject:ge];
-            }
-            gPanelView.entries = items;
+            NSArray<GFEntry *> *items = gf_buildEntries(d);
+            gPanelView.entries  = items;
             gPanelView.selected = selected;
 
-            // Size the panel to the content, clamped to the screen under the cursor.
+            // Size + center on the screen under the cursor.
             NSSize ps = gf_preferredPanelSize(d->count);
             NSPoint cursor = [NSEvent mouseLocation];
             NSScreen *screen = [NSScreen mainScreen];
@@ -638,22 +807,23 @@ void gf_showPanel(void *data, int selected) {
             [gPanel orderFrontRegardless];
             atomic_store(&gActive, 1);
 
-            // Fill in cache misses, and refresh stale cached entries, in the
-            // background. Each gf_captureAsync schedules its own work and
-            // updates the live panel entry when it completes.
-            NSDate *now = [NSDate date];
-            for (GFEntry *e in items) {
-                if (e.minimized || e.windowID == 0) continue;
-                if (!e.thumbLoaded) {
-                    gf_captureAsync(e.windowID);
-                    continue;
-                }
-                NSDate *age = gThumbAge[@(e.windowID)];
-                if (!age || [now timeIntervalSinceDate:age] > kThumbStaleAfter) {
-                    gf_captureAsync(e.windowID);
-                }
-            }
+            gf_fireCaptureRefresh(items);
+            freePanelData(d);
+        }
+    });
+}
 
+// In-place entry refresh used by gfOnClose. Skips the resize/recenter so the
+// panel doesn't visually jump after each X-click, and skips capture refresh
+// because the captures fired by the initial show are still in flight.
+void gf_updatePanelEntries(void *data, int selected) {
+    gf_pd_t *d = (gf_pd_t *)data;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            if (!gPanelView) { freePanelData(d); return; }
+            gPanelView.entries  = gf_buildEntries(d);
+            gPanelView.selected = selected;
+            [gPanelView setNeedsDisplay:YES];
             freePanelData(d);
         }
     });
@@ -662,8 +832,7 @@ void gf_showPanel(void *data, int selected) {
 void gf_updateSelection(int selected) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!gPanelView) return;
-        gPanelView.selected = selected;
-        [gPanelView setNeedsDisplay:YES];
+        [gPanelView updateSelection:selected];
     });
 }
 
@@ -686,7 +855,18 @@ void gf_hidePanel(void) {
 // =========================================================================
 
 void gf_activateWindow(void *axRefPtr, int pid, int minimized) {
-    if (!axRefPtr) return;
+    // Unresponsive-app placeholder: no AX ref, just bring the app forward.
+    if (!axRefPtr) {
+        if (pid <= 0) return;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @autoreleasepool {
+                NSRunningApplication *app = [NSRunningApplication
+                    runningApplicationWithProcessIdentifier:(pid_t)pid];
+                [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+            }
+        });
+        return;
+    }
     AXUIElementRef w = (AXUIElementRef)axRefPtr;
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
@@ -712,6 +892,201 @@ void gf_activateWindow(void *axRefPtr, int pid, int minimized) {
             NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:(pid_t)pid];
             [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
             CFRelease(w);
+        }
+    });
+}
+
+void gf_closeWindow(void *axRefPtr) {
+    if (!axRefPtr) return;
+    // Retain because the caller may release its own reference before this
+    // block runs on the main queue.
+    AXUIElementRef w = (AXUIElementRef)CFRetain((CFTypeRef)axRefPtr);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            AXUIElementRef closeBtn = NULL;
+            AXError err = AXUIElementCopyAttributeValue(
+                w, kAXCloseButtonAttribute, (CFTypeRef *)&closeBtn);
+            if (err == kAXErrorSuccess && closeBtn) {
+                AXUIElementPerformAction(closeBtn, kAXPressAction);
+                CFRelease(closeBtn);
+            }
+            CFRelease(w);
+        }
+    });
+}
+
+// qsort comparator: ascending by zOrder (frontmost first).
+static int gf_cmpZOrder(const void *a, const void *b) {
+    int za = ((const gf_window_t *)a)->zOrder;
+    int zb = ((const gf_window_t *)b)->zOrder;
+    return (za > zb) - (za < zb);
+}
+
+void gf_minimizeAll(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            int n = 0;
+            gf_window_t *w = gf_enumerateWindows(&n, 0);
+            if (!w) return;
+            for (int i = 0; i < n; i++) {
+                if (!w[i].minimized && w[i].axRef) {
+                    AXUIElementSetAttributeValue(
+                        (AXUIElementRef)w[i].axRef,
+                        kAXMinimizedAttribute, kCFBooleanTrue);
+                }
+                free(w[i].title);
+                free(w[i].appName);
+                if (w[i].axRef) gf_release(w[i].axRef);
+            }
+            free(w);
+        }
+    });
+}
+
+// Best-effort un-fullscreen. Some apps expose kAXFullScreenAttribute and let
+// us toggle it; if they do and the window is full-screen, flip it back to
+// windowed so the subsequent position-set has a chance of taking effect.
+static BOOL gf_isFullScreen(AXUIElementRef ax) {
+    CFTypeRef fs = NULL;
+    AXError err = AXUIElementCopyAttributeValue(ax,
+        CFSTR("AXFullScreen"), &fs);
+    BOOL out = NO;
+    if (err == kAXErrorSuccess && fs) {
+        if (CFGetTypeID(fs) == CFBooleanGetTypeID()) {
+            out = CFBooleanGetValue((CFBooleanRef)fs);
+        }
+        CFRelease(fs);
+    }
+    return out;
+}
+
+void gf_cascadeAll(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            int n = 0;
+            gf_window_t *w = gf_enumerateWindows(&n, 0);
+            if (!w) return;
+            // Front-to-back, so the first iteration ends up at the cascade
+            // origin and later windows tuck behind it.
+            qsort(w, n, sizeof(gf_window_t), gf_cmpZOrder);
+
+            // Cascade onto the screen under the mouse.
+            NSPoint cursor = [NSEvent mouseLocation];
+            NSScreen *screen = [NSScreen mainScreen];
+            for (NSScreen *s in [NSScreen screens]) {
+                if (NSPointInRect(cursor, s.frame)) { screen = s; break; }
+            }
+            NSRect vf = screen.visibleFrame;
+
+            // AX uses a y-down coordinate space with origin at the primary
+            // screen's top-left; AppKit uses y-up with origin at the primary
+            // screen's bottom-left. Convert vf's top-left into AX space.
+            CGFloat primaryH = [[NSScreen screens] firstObject].frame.size.height;
+            CGFloat axStartX = vf.origin.x;
+            CGFloat axStartY = primaryH - (vf.origin.y + vf.size.height);
+
+            CGFloat offset  = 32.0;
+            // Wrap the staircase when it would push windows off the visible
+            // area, leaving ~300pt of vertical room for the trailing window's
+            // content to remain visible.
+            CGFloat budget  = MAX(vf.size.height - 300.0, offset * 2);
+            int     maxStep = MAX(1, (int)(budget / offset));
+
+            // Uniform target size: 75% of the visible area, clamped to
+            // sensible bounds so windows aren't huge on big displays or
+            // unusable on small ones.
+            CGFloat targetW = vf.size.width  * 0.75;
+            CGFloat targetH = vf.size.height * 0.75;
+            if (targetW > 1600) targetW = 1600;
+            if (targetH > 1000) targetH = 1000;
+            if (targetW < 480)  targetW = 480;
+            if (targetH < 320)  targetH = 320;
+
+            int moved = 0, resized = 0, skipped = 0;
+            for (int i = 0; i < n; i++) {
+                AXUIElementRef ax = (AXUIElementRef)w[i].axRef;
+                if (!ax) { skipped++; continue; }
+
+                if (w[i].minimized) {
+                    AXUIElementSetAttributeValue(ax, kAXMinimizedAttribute,
+                                                 kCFBooleanFalse);
+                }
+                if (gf_isFullScreen(ax)) {
+                    AXUIElementSetAttributeValue(ax,
+                        CFSTR("AXFullScreen"), kCFBooleanFalse);
+                }
+
+                Boolean settable = false;
+                AXError serr = AXUIElementIsAttributeSettable(ax,
+                    kAXPositionAttribute, &settable);
+                if (serr != kAXErrorSuccess || !settable) {
+                    fprintf(stderr,
+                        "go-fish cascade: skipping \"%s\" (%s) — position not settable (err=%d settable=%d)\n",
+                        w[i].title ?: "", w[i].appName ?: "",
+                        (int)serr, (int)settable);
+                    skipped++;
+                    continue;
+                }
+
+                // Reversed order: back-most window (highest zOrder) lands at
+                // the top-left, each more-front window steps down-right. This
+                // way every window's title bar peeks out above the one in
+                // front of it, since z-order is preserved.
+                int step = (n - 1 - i) % maxStep;
+                CGPoint pt = CGPointMake(axStartX + offset * step,
+                                         axStartY + offset * step);
+                AXValueRef ptVal = AXValueCreate(kAXValueCGPointType, &pt);
+                if (!ptVal) { skipped++; continue; }
+                AXError perr = AXUIElementSetAttributeValue(ax,
+                    kAXPositionAttribute, ptVal);
+                CFRelease(ptVal);
+                if (perr != kAXErrorSuccess) {
+                    fprintf(stderr,
+                        "go-fish cascade: failed to move \"%s\" (%s) — AXError=%d\n",
+                        w[i].title ?: "", w[i].appName ?: "", (int)perr);
+                    skipped++;
+                    continue;
+                }
+                moved++;
+
+                // Resize is best-effort and independent of the move. Some
+                // apps (Calculator, Maps, fixed-UI Electron tools) refuse
+                // size writes; the cascade position still lands either way.
+                Boolean szSettable = false;
+                AXError szerr = AXUIElementIsAttributeSettable(ax,
+                    kAXSizeAttribute, &szSettable);
+                if (szerr == kAXErrorSuccess && szSettable) {
+                    CGSize sz = CGSizeMake(targetW, targetH);
+                    AXValueRef szVal = AXValueCreate(kAXValueCGSizeType, &sz);
+                    if (szVal) {
+                        AXError rerr = AXUIElementSetAttributeValue(ax,
+                            kAXSizeAttribute, szVal);
+                        CFRelease(szVal);
+                        if (rerr == kAXErrorSuccess) {
+                            resized++;
+                        } else {
+                            fprintf(stderr,
+                                "go-fish cascade: resize rejected for \"%s\" (%s) — AXError=%d\n",
+                                w[i].title ?: "", w[i].appName ?: "", (int)rerr);
+                        }
+                    }
+                } else {
+                    fprintf(stderr,
+                        "go-fish cascade: size not settable for \"%s\" (%s) — err=%d settable=%d\n",
+                        w[i].title ?: "", w[i].appName ?: "",
+                        (int)szerr, (int)szSettable);
+                }
+            }
+            fprintf(stderr,
+                    "go-fish cascade: moved %d, resized %d, skipped %d of %d (target %.0fx%.0f)\n",
+                    moved, resized, skipped, n, targetW, targetH);
+
+            for (int i = 0; i < n; i++) {
+                free(w[i].title);
+                free(w[i].appName);
+                if (w[i].axRef) gf_release(w[i].axRef);
+            }
+            free(w);
         }
     });
 }
@@ -1009,6 +1384,8 @@ static void gf_setupMRUTracking(void) {
 
 @interface GFStatusHandler : NSObject
 - (void)showGrid:(id)sender;
+- (void)minimizeAll:(id)sender;
+- (void)cascadeAll:(id)sender;
 - (void)quit:(id)sender;
 @end
 
@@ -1019,6 +1396,8 @@ static void gf_setupMRUTracking(void) {
     if (atomic_load(&gActive)) gfOnCancel();
     gfOnHotkey(0, 0);
 }
+- (void)minimizeAll:(id)sender { gf_minimizeAll(); }
+- (void)cascadeAll:(id)sender  { gf_cascadeAll();  }
 - (void)quit:(id)sender {
     [NSApp terminate:nil];
 }
@@ -1103,7 +1482,23 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
                                                keyEquivalent:@""];
     showItem.target = gStatusHandler;
     [menu addItem:showItem];
+
     [menu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *minItem = [[NSMenuItem alloc] initWithTitle:@"Minimize All"
+                                                     action:@selector(minimizeAll:)
+                                              keyEquivalent:@""];
+    minItem.target = gStatusHandler;
+    [menu addItem:minItem];
+
+    NSMenuItem *cascadeItem = [[NSMenuItem alloc] initWithTitle:@"Cascade All"
+                                                         action:@selector(cascadeAll:)
+                                                  keyEquivalent:@""];
+    cascadeItem.target = gStatusHandler;
+    [menu addItem:cascadeItem];
+
+    [menu addItem:[NSMenuItem separatorItem]];
+
     NSMenuItem *quitItem = [[NSMenuItem alloc] initWithTitle:@"Quit"
                                                       action:@selector(quit:)
                                                keyEquivalent:@"q"];

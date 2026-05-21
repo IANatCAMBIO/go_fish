@@ -114,11 +114,33 @@ go_fish/
 └── src/
     ├── go.mod             # module declaration, no third-party deps
     ├── main.go            # entry point, permission checks, runs NSApp
-    ├── switcher.go        # Go state machine; exports gfOnHotkey / gfOnCommit / gfOnCancel / gfSetSelection to C
+    ├── switcher.go        # Go state machine; exports gfOnHotkey / gfOnCommit / gfOnCancel / gfSetSelection / gfOnClose to C
     ├── cocoa.h            # C interface between Go and Objective-C
-    ├── cocoa.m            # Cocoa: event tap, AX enumeration, panel UI, status item, MRU, thumbnail cache, activation
+    ├── cocoa.m            # Cocoa: event tap, AX enumeration, panel UI, status item, MRU, thumbnail cache, activation, close, minimize-all / cascade-all
     └── hook.png           # menu-bar icon, embedded via go:embed
 ```
+
+### C surface (cocoa.h)
+
+The Go ↔ Objective-C contract is small but worth knowing if you're
+editing either side:
+
+- `gf_enumerateWindows(out_count, filterPID)` — main snapshot call. Per
+  app, sets a 100 ms AX messaging timeout; unresponsive apps surface as
+  a single `unresponsive=1` entry with `axRef=NULL`.
+- `gf_activateWindow(axRef, pid, minimized)` — un-minimize + raise +
+  activate. Accepts `axRef=NULL` for unresponsive placeholders (falls
+  back to app-only activation via `NSRunningApplication`).
+- `gf_closeWindow(axRef)` — presses the window's AX close button.
+- `gf_minimizeAll()` / `gf_cascadeAll()` — menu-bar bulk actions.
+- `gf_showPanel(data, selected)` — full panel show with resize +
+  recenter.
+- `gf_updatePanelEntries(data, selected)` — in-place entry refresh
+  (no resize/recenter); used after closing a window so the panel
+  doesn't visually jump.
+- `gf_updateSelection(selected)` — fast-path selection change. Dirties
+  only the previously-selected and newly-selected cells so mouse-hover
+  redraws stay cheap with large grids.
 
 The menu-bar icon is embedded into the binary at build time via a `go:embed`
 directive in `main.go`, so the resulting executable is fully self-contained —

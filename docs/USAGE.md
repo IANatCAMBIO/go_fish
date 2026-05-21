@@ -28,9 +28,19 @@ System Settings > Keyboard > Keyboard Shortcuts > Mission Control.
 ```
 
 A fishing-hook icon appears in the right side of the menu bar while
-go-fish is running. Click it to drop down a menu with two items:
+go-fish is running. Click it to drop down a menu:
 
 - **Show Window Grid** — opens the all-apps grid (same as Cmd+Tab).
+- **Minimize All** — minimizes every standard window of every regular
+  app. Windows already minimized are skipped.
+- **Cascade All** — un-minimizes minimized windows, resizes each to
+  ~75% of the visible screen area (clamped to 480×320 / 1600×1000), and
+  arranges them in a staircase on the screen under the cursor. The
+  cascade runs back-to-front, so the bottom-most window lands at the
+  top-left and every window's title bar stays visible. Apps that refuse
+  AX position writes (fixed-UI Electron tools, full-screen apps that
+  don't expose `AXFullScreen`, etc.) are skipped silently; the log file
+  (`~/Library/Logs/go-fish.err.log`) records which.
 - **Quit** — terminates go-fish. The keyboard shortcut listed beside it
   (⌘Q) only works while the menu is open; there's no key window
   otherwise.
@@ -65,6 +75,7 @@ trigger go-fish, the system binding is the first thing to check.
 | **Shift + Tab** (while grid is open) | Cycle backward                                |
 | **Move mouse over a tile**      | Hover-select: the selection follows the cursor     |
 | **Click a tile**                | Select that tile and commit immediately            |
+| **Click the X on a tile**       | Close that window (AX-press its close button); the tile drops out of the grid without dismissing the panel |
 | **Release Cmd**                 | Commit: focus the selected window                  |
 | **Escape**                      | Cancel: close the grid, do nothing                 |
 
@@ -95,8 +106,29 @@ Every "standard" window of every running app whose activation policy is
 - Windows on other Spaces / other displays
 - Minimized windows (shown with their app icon and a small "minimized"
   badge, since no live image is available)
+- One placeholder per **unresponsive app** — apps that don't reply to
+  the AX windows query within 100 ms. The placeholder uses the app icon,
+  shows a red "not responding" badge, dims the tile to 70%, and omits
+  the X button (we can't reliably close a specific window through an
+  app that isn't talking back). Clicking the tile still activates the
+  app via `NSRunningApplication`, which usually unsticks it.
 
 It excludes palettes, system dialogs, menu-bar–only apps, the Dock, etc.
+
+### Tile anatomy
+
+Each tile shows, top to bottom:
+
+- The **app name** (bold, centered), with an **X close button** to its
+  left in the same horizontal band.
+- The **thumbnail** (live capture for visible windows; app icon for
+  minimized or just-snapshotted ones). A "minimized" or "not responding"
+  badge overlays the top-left when applicable.
+- The **window title** (or the app name as a fallback when the window
+  has no title).
+
+The selected tile is wrapped in a translucent accent-colored highlight
+that follows the keyboard or mouse selection.
 
 Windows are ordered **most-recently-used first**, so:
 
@@ -121,12 +153,17 @@ For now go-fish has no config file — the hotkey is fixed at **Cmd+Tab** by
 design (it's the slot you've chosen to replace). Future configuration
 points, if you want them:
 
-| Setting          | Where to change in source           | Default               |
-| ---------------- | ----------------------------------- | --------------------- |
-| Trigger keycode  | `cocoa.m` → `tapCallback` `0x30`    | Tab                   |
-| Trigger modifier | `cocoa.m` → `kCGEventFlagMaskCommand` | Cmd                 |
-| Tile size        | `cocoa.m` → `GFPanelView.drawRect`  | 200pt wide tiles      |
-| Panel dimensions | `cocoa.m` → `ensurePanel`           | 85% × 70% of main screen |
+| Setting              | Where to change in source                  | Default                  |
+| -------------------- | ------------------------------------------ | ------------------------ |
+| Trigger keycode      | `cocoa.m` → `tapCallback` `0x30`           | Tab                      |
+| Trigger modifier     | `cocoa.m` → `kCGEventFlagMaskCommand`      | Cmd                      |
+| Tile size            | `cocoa.m` → `gf_preferredPanelSize` `tileW`| 240pt wide tiles         |
+| Panel clamp          | `cocoa.m` → `gf_showPanel` `maxW`/`maxH`   | 90% × 85% of screen      |
+| Per-app AX timeout   | `cocoa.m` → `kAXAppTimeout`                | 0.1 s                    |
+| Thumbnail cache cap  | `cocoa.m` → `kThumbCap`                    | 30 entries               |
+| Thumbnail stale-after| `cocoa.m` → `kThumbStaleAfter`             | 30 s                     |
+| Cascade offset       | `cocoa.m` → `gf_cascadeAll` `offset`       | 32pt                     |
+| Cascade target size  | `cocoa.m` → `gf_cascadeAll` `targetW/H`    | 75% of vf, clamped       |
 
 To rebuild after editing, see `BUILDING.md`.
 
@@ -252,6 +289,28 @@ Some sandboxed apps return AX window elements that don't accept
 owning app, which usually brings *some* window of that app forward but may
 not be the exact one you selected. Known offender: certain Electron apps
 in unusual states.
+
+### An app shows up as "not responding"
+
+The app didn't reply to go-fish's AX windows query within the per-app
+budget (100 ms by default — see `kAXAppTimeout` in `cocoa.m`). The most
+common causes are an app stuck waiting on disk/network, mid-launch
+initialization, or an in-progress modal that hasn't fully realized. The
+placeholder tile lets you still bring the app forward — clicking it
+calls `activateWithOptions:` on the process, which often unsticks the
+event loop. If you want to be more aggressive: right-click the Dock icon
+and choose Force Quit, or `kill <pid>` from a shell.
+
+### Cascade All didn't move some windows
+
+`Cascade All` writes `kAXPositionAttribute` on each window, but some apps
+refuse position writes (fixed-UI tools, full-screen apps that don't
+expose `AXFullScreen`, certain Electron apps). Skipped windows are
+logged to `~/Library/Logs/go-fish.err.log` with their app name and the
+AX error code; a summary line at the end reports `moved N, resized M,
+skipped K of T`. Full-screen apps are best-effort un-fullscreened first
+(via the undocumented `AXFullScreen` attribute) — works for Safari,
+Mail, most Apple apps; not for every third-party.
 
 ### After granting permissions, it still complains
 
