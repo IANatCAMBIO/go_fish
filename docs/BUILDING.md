@@ -80,25 +80,59 @@ For a universal binary covering both Apple Silicon and Intel:
 lipo -create -output bin/go-fish bin/go-fish-arm64 bin/go-fish-amd64
 ```
 
-## Code signing (optional but recommended)
+## Code signing
 
-macOS remembers the granted Accessibility / Screen Recording permissions
-**per signing identity**. An unsigned, rebuilt binary will be treated as a
-new app each time and re-prompt for permissions.
+macOS remembers granted Accessibility / Screen Recording permissions
+**per signing identity**. What "identity" means depends on how the
+binary is signed:
 
-`./install.sh` does an ad-hoc sign (`codesign --force --sign -`) on
-`bin/go-fish` before copying it to `/usr/local/bin`, which gives the
-binary a stable hash identity across rebuilds. If you want to sign with
-your Apple Developer ID instead, do it before running the installer (or
-re-sign the installed copy):
+| Signing method                    | TCC identity                | Survives rebuild? |
+| --------------------------------- | --------------------------- | ----------------- |
+| Unsigned                          | binary path (loose)         | Unreliable; usually re-prompts |
+| Ad-hoc (`codesign --sign -`)      | **CDHash** (content hash)   | **No** — content changes → CDHash changes → re-prompt |
+| Self-signed cert from Keychain    | cert's identity             | Yes               |
+| Developer ID Application          | Team ID + bundle/binary ID  | Yes               |
+
+`./install.sh` does an ad-hoc sign as the convenient default — it
+requires no setup and lets the script run unattended. The trade-off is
+that **every rebuild re-prompts** for Accessibility/Screen Recording,
+because the CDHash changes. The fix is documented in
+`USAGE.md` → *After granting permissions, it still complains*.
+
+### Stable identity via a self-signed cert
+
+For a free local fix that survives rebuilds, create a self-signed
+code-signing cert in **Keychain Access → Certificate Assistant →
+Create a Certificate…**:
+
+- **Name:** anything memorable, e.g. `go-fish-signer`
+- **Identity Type:** Self Signed Root
+- **Certificate Type:** Code Signing
+
+After creating it, sign manually before running the installer:
 
 ```sh
-codesign --sign - --force bin/go-fish                                  # ad-hoc (what install.sh does)
-codesign --sign "Developer ID Application: …" --options runtime bin/go-fish
+codesign --force --sign go-fish-signer bin/go-fish
+./install.sh                              # without --build, so the signed binary is what gets installed
 ```
 
-After re-signing, you may need to remove and re-grant the permissions
-once.
+The first run after this will prompt for permissions one more time;
+subsequent rebuilds signed with the same cert will keep them.
+
+### Developer ID
+
+If you have an Apple Developer account, sign with your Developer ID
+instead — same effect as a self-signed cert, plus the binary will work
+on machines other than yours:
+
+```sh
+codesign --sign "Developer ID Application: …" --options runtime --force bin/go-fish
+```
+
+After switching signing identities (ad-hoc → self-signed, self-signed →
+Developer ID, etc.), you'll need to remove the old go-fish entry from
+System Settings → Privacy & Security → Accessibility (and Screen
+Recording) once.
 
 ## Project layout
 

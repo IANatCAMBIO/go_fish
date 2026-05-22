@@ -1029,9 +1029,9 @@ void gf_cascadeAll(void) {
                 }
 
                 // Reversed order: back-most window (highest zOrder) lands at
-                // the top-left, each more-front window steps down-right. This
-                // way every window's title bar peeks out above the one in
-                // front of it, since z-order is preserved.
+                // the top-left, each more-front window steps down-right. The
+                // post-loop raise pass below restores z-order so every
+                // window's title bar peeks out above the one in front of it.
                 int step = (n - 1 - i) % maxStep;
                 CGPoint pt = CGPointMake(axStartX + offset * step,
                                          axStartY + offset * step);
@@ -1080,6 +1080,32 @@ void gf_cascadeAll(void) {
             fprintf(stderr,
                     "go-fish cascade: moved %d, resized %d, skipped %d of %d (target %.0fx%.0f)\n",
                     moved, resized, skipped, n, targetW, targetH);
+
+            // Un-minimize, exit-fullscreen, and (on some apps) the AX
+            // position write itself raise the affected window in the global
+            // z-stack, breaking the assumption above that z-order survives
+            // the cascade. Walk back-to-front and re-raise each window so the
+            // staircase ends with the original frontmost on top. Spaced via
+            // dispatch_after because consecutive cross-app activations race
+            // in WindowServer when fired in a tight loop.
+            for (int i = n - 1; i >= 0; i--) {
+                if (!w[i].axRef) continue;
+                AXUIElementRef axRef =
+                    (AXUIElementRef)CFRetain((CFTypeRef)w[i].axRef);
+                pid_t pid = (pid_t)w[i].pid;
+                int delaySteps = (n - 1) - i;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                             (int64_t)delaySteps * 40 * NSEC_PER_MSEC),
+                               dispatch_get_main_queue(), ^{
+                    @autoreleasepool {
+                        AXUIElementPerformAction(axRef, kAXRaiseAction);
+                        NSRunningApplication *app = [NSRunningApplication
+                            runningApplicationWithProcessIdentifier:pid];
+                        [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+                        CFRelease(axRef);
+                    }
+                });
+            }
 
             for (int i = 0; i < n; i++) {
                 free(w[i].title);

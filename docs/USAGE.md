@@ -314,7 +314,24 @@ Mail, most Apple apps; not for every third-party.
 
 ### After granting permissions, it still complains
 
-Permissions are tied to the binary's signing identity. If the binary is
-unsigned, every rebuild looks like a new app to macOS. See the
-"Code signing" section of `BUILDING.md` to ad-hoc sign the binary, which
-gives it a stable identifier across rebuilds.
+Permissions are tied to the binary's signing identity. For an ad-hoc
+signed binary (what `install.sh` produces by default), that identity is
+the **CDHash** — a hash of the binary's bytes. Every rebuild produces
+different bytes, so a fresh CDHash, so macOS treats it as a new app and
+re-prompts.
+
+The System Settings UI shows one entry per path, so you'll see the
+go-fish row still toggled **on** — but that's the previous CDHash's
+grant. The OS is waiting on permission for the current binary.
+
+**To fix once:** in **System Settings → Privacy & Security → Accessibility**,
+select the go-fish row and click the **−** button to remove it entirely.
+Do the same under **Screen Recording**. Re-run `./install.sh`. The next
+prompt will create a fresh entry that matches the running binary, and
+it'll stick until the next rebuild.
+
+**To stop the cycle:** stop using ad-hoc signing. Either
+(a) install once and don't rebuild, or
+(b) sign with a stable identity (Developer ID, or a self-signed code-
+signing cert you create in Keychain Access). See `BUILDING.md` →
+*Code signing* for both options.
