@@ -23,45 +23,69 @@ the same app.
 - **Space-aware** — activating a window on another Space switches Spaces
   automatically
 - **Menu-bar entry** with Show Window Grid, Minimize All, Cascade All,
-  and Quit
+  Start at boot, Secure Event Input detection, and Quit
+- **Opt-in auto-launch** — toggle **Start at boot** in the menu to
+  install a LaunchAgent (with a built-in 3-attempt backoff so a missing
+  permission can never turn into a restart loop)
+- **Secure Event Input awareness** — when an app holds Secure Event
+  Input (Terminal during `sudo`, password managers, some VPN clients),
+  Cmd+Tab is invisible to *any* third-party event tap. go-fish polls
+  for this state and overlays a red X on the menu-bar icon so you know
+  the switcher is temporarily unavailable and why.
 - **Thumbnail caching** so the grid opens instantly for recently-focused
   windows
 - **Auto-sized panel** that adapts to the number of open windows
+- **Parallel window enumeration** — the per-app AX queries run
+  concurrently via GCD, so total grid-open latency is `max(per-app
+  latency)` rather than the sum across every running app
 - **Always-on background app** ~0% idle CPU, ~60–80 MB resident
 - **Scoped to one Space** With multiple Spaces in MacOS, go_fish will only show apps on your current space
 
 ## Quickstart
 
 ```sh
-# Build + install in one shot (compiles ./src → ./bin/go-fish,
-# then copies to /usr/local/bin and loads the LaunchAgent).
+# Build + install in one shot (compiles ./src → ./bin/go-fish, then
+# copies to ~/Applications/go-fish). No sudo, no LaunchAgent by default.
 # Requires Go 1.22+ and Xcode Command Line Tools.
 ./install.sh --build
 
 # Or, if you already have a prebuilt binary at ./bin/go-fish:
 ./install.sh
 
-# Uninstall:
+# Total uninstall (kills process, removes LaunchAgent if installed,
+# removes binary, prompts to remove logs):
 ./install.sh uninstall
 ```
 
-After installing, finish setup in **System Settings**:
+After installing, launch go-fish (it does not start automatically):
 
-1. **Privacy & Security → Accessibility** → enable `/usr/local/bin/go-fish`
-2. **Privacy & Security → Screen Recording** → enable `/usr/local/bin/go-fish`
-3. **Keyboard → Keyboard Shortcuts → Mission Control** → uncheck Cmd+Tab
-4. **Keyboard → Keyboard Shortcuts → Keyboard** → uncheck "Move focus to
-   next window in active app" (Cmd+\`)
+```sh
+open ~/Applications/go-fish
+```
 
-Then press Cmd+Tab. The grid pops up. Cycle with Tab, release Cmd to
-commit, Esc to cancel.
+The first launch will prompt for two permissions in **System Settings →
+Privacy & Security**:
+
+1. **Accessibility** → enable `~/Applications/go-fish`
+2. **Screen Recording** → enable `~/Applications/go-fish`
+
+Then re-launch. Also under **System Settings → Keyboard → Keyboard
+Shortcuts**:
+
+3. **Mission Control** → uncheck Cmd+Tab
+4. **Keyboard** → uncheck "Move focus to next window in active app"
+   (Cmd+\`)
+
+Press Cmd+Tab. The grid pops up. Cycle with Tab, release Cmd to commit,
+Esc to cancel. If you want go-fish back automatically next login, click
+the menu-bar hook and check **Start at boot**.
 
 ## Repo layout
 
 ```
 go_fish/
 ├── README.md
-├── install.sh             # build / install / uninstall the LaunchAgent
+├── install.sh             # build / install / uninstall (no LaunchAgent by default)
 ├── bin/go-fish            # prebuilt binary (also produced by --build)
 ├── docs/{USAGE,BUILDING}.md
 └── src/                   # Go + Objective-C source + embedded hook.png
@@ -69,8 +93,9 @@ go_fish/
 
 ## Documentation
 
-- [docs/USAGE.md](docs/USAGE.md) — full keyboard/mouse reference,
-  LaunchAgent management, configuration, troubleshooting
+- [docs/USAGE.md](docs/USAGE.md) — full keyboard/mouse reference, menu
+  items, auto-launch / "Start at boot", Secure Event Input behavior,
+  configuration, troubleshooting
 - [docs/BUILDING.md](docs/BUILDING.md) — build requirements, code
   signing, cross-compilation
 
@@ -80,9 +105,15 @@ Written in Go with a CGO bridge to AppKit, Accessibility, and
 CoreGraphics:
 
 - **Hotkey capture** — a global `CGEventTap` intercepts Cmd+Tab and
-  Cmd+\` before they reach the focused app
+  Cmd+\` before they reach the focused app. macOS Secure Event Input
+  bypasses *all* third-party taps; a 1.5 s poller against
+  `IsSecureEventInputEnabled()` (resolved via `dlsym`) detects this and
+  paints a red-X overlay on the menu-bar icon so the user knows the
+  switcher is unavailable and why.
 - **Window enumeration** — `kAXWindowsAttribute` per running app,
-  snapshotted on demand (no background polling). A 100 ms per-app
+  snapshotted on demand (no background polling) and parallelized across
+  apps via `dispatch_apply` so latency scales with the slowest app, not
+  the sum of all apps. A 100 ms per-app
   `AXUIElementSetMessagingTimeout` guards against unresponsive processes
   stalling the snapshot; the offending app appears as a placeholder
   instead.
@@ -96,4 +127,11 @@ CoreGraphics:
 - **Activation** — `kAXMinimizedAttribute = false` + `kAXRaiseAction` +
   `NSRunningApplication.activateWithOptions:`; macOS handles the Space
   switch as a side-effect
+- **Optional auto-launch** — the **Start at boot** menu item writes
+  `~/Library/LaunchAgents/com.local.gofish.plist` pointing at the
+  running binary's `realpath`. The plist sets `ThrottleInterval=30`,
+  and the binary itself tracks permission-failure attempts in
+  `~/Library/Application Support/go-fish/attempts.txt`, giving up
+  cleanly (`exit 0`) after the 3rd failed preflight so launchd's
+  `SuccessfulExit=false` doesn't loop.
 

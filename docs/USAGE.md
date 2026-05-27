@@ -6,9 +6,17 @@ minimized ones, each addressable individually.
 
 ## First run
 
+After `./install.sh` puts the binary at `~/Applications/go-fish`,
+launch it:
+
 ```sh
-./go-fish
+open ~/Applications/go-fish
 ```
+
+(Or double-click `go-fish` in Finder.) The installer does **not**
+register a LaunchAgent — go-fish runs as a normal foreground binary you
+start yourself. Auto-launch on login is opt-in via the **Start at boot**
+menu item once go-fish is up.
 
 On the first launch, go-fish needs two permissions and will exit with a
 message after each. Grant them in **System Settings → Privacy & Security**:
@@ -19,7 +27,15 @@ message after each. Grant them in **System Settings → Privacy & Security**:
    Without it, every tile falls back to the app icon (the program still
    works, just less informative).
 
-After granting both, run `./go-fish` again. You should see:
+If you launch before granting permissions, the binary will exit and
+write the failure to its attempt counter at
+`~/Library/Application Support/go-fish/attempts.txt`. The next two
+launches add a 1 s and 2 s sleep before retrying; after a 3rd failed
+preflight, the binary exits *cleanly* (`exit 0`) — which matters under
+the LaunchAgent path because launchd's `SuccessfulExit=false` keep-alive
+won't restart it. A successful start resets the counter.
+
+After granting both, re-launch. You should see:
 
 ```
 go-fish running. Press Cmd+Tab to switch windows, or click the hook in the menu bar.
@@ -41,6 +57,20 @@ go-fish is running. Click it to drop down a menu:
   AX position writes (fixed-UI Electron tools, full-screen apps that
   don't expose `AXFullScreen`, etc.) are skipped silently; the log file
   (`~/Library/Logs/go-fish.err.log`) records which.
+- **Start at boot** (toggle) — writes / removes
+  `~/Library/LaunchAgents/com.local.gofish.plist` pointing at the
+  running binary's resolved path. Effective on next login; the currently
+  running instance is not affected. Turning it off while running under
+  launchd schedules a `launchctl bootout` so the agent doesn't reload
+  the binary next time. See **Running in the background** below for the
+  contract details.
+- **Secure Event Input detection** (toggle) — when checked (default),
+  go-fish polls `IsSecureEventInputEnabled()` every 1.5 s. While Secure
+  Event Input is held by another app, the menu-bar icon gets a red X
+  overlay and the tooltip changes to "go-fish unavailable — Secure
+  Event Input is active". Cmd+Tab really *is* unavailable in that
+  state — macOS routes keyboard events past every third-party event
+  tap. See **Troubleshooting → Cmd+Tab silently does nothing** below.
 - **Quit** — terminates go-fish. The keyboard shortcut listed beside it
   (⌘Q) only works while the menu is open; there's no key window
   otherwise.
@@ -169,36 +199,52 @@ To rebuild after editing, see `BUILDING.md`.
 
 ## Running in the background, always
 
-go-fish runs as an accessory app (no Dock icon by default; only the menu-bar
-hook) and idles at effectively zero CPU until you press the hotkey. To start
-it automatically on login, use a per-user `LaunchAgent`.
+go-fish runs as an accessory app (no Dock icon by default; only the
+menu-bar hook) and idles at effectively zero CPU until you press the
+hotkey.
 
-### Easy path: `install.sh`
-
-The repo includes a zsh installer that does everything for you:
+### Install
 
 ```sh
-./install.sh              # install the prebuilt binary at ./bin/go-fish
+./install.sh              # install the prebuilt ./bin/go-fish into ~/Applications/
 ./install.sh --build      # compile ./src → ./bin/go-fish first (needs Go + Xcode CLT)
-./install.sh uninstall    # stop and remove
+./install.sh uninstall    # full teardown: stops process, removes LaunchAgent
+                          # (if any), removes the binary, optionally clears logs
 ```
 
-The default install path expects a prebuilt `./bin/go-fish` (which the
-repo ships with) so the target machine doesn't need a Go toolchain. If
-you do have Go installed and want to rebuild from source as part of the
-install, pass `--build` — that compiles inside `./src/` and writes the
-output back to `./bin/go-fish`.
+The installer **does not** register a LaunchAgent. It just builds
+(optional), ad-hoc signs, and copies the binary to
+`~/Applications/go-fish`. Launch it manually via `open
+~/Applications/go-fish` or by double-clicking in Finder.
 
-It ad-hoc signs the local binary (so the Accessibility / Screen
-Recording grants survive future rebuilds when you re-run this script),
-copies it to `/usr/local/bin/go-fish` (prompting for sudo once), drops a
-plist into `~/Library/LaunchAgents/`, and loads it. Re-running is safe —
-it unloads the previous version first.
+`install.sh` exports `GOCACHE=/tmp/go-fish-cache` before building, which
+sidesteps the root-owned `~/Library/Caches/go-build` trap that can
+appear on machines where `go build` was once run under `sudo`.
 
-### Manual path
+### Auto-launch on login: Start at boot
 
-If you'd rather wire it up by hand, create
-`~/Library/LaunchAgents/com.local.gofish.plist`:
+Open the menu-bar hook and check **Start at boot**. That writes
+`~/Library/LaunchAgents/com.local.gofish.plist` pointing at the running
+binary's resolved path. Contract:
+
+- **No effect on the currently running instance.** We deliberately do
+  *not* `launchctl load` immediately — that would spawn a second
+  go-fish under launchd's management, fighting the first for the event
+  tap. The plist takes effect on your next login.
+- **Unchecking** removes the plist. If go-fish is currently running
+  under launchd (`getppid() == 1`), it schedules a `launchctl bootout`
+  so the agent is detached and won't relaunch the binary on exit.
+- **Crash-loop guard.** The plist sets `ThrottleInterval=30` (launchd's
+  minimum gap between launches). The binary itself adds an attempt
+  counter (`~/Library/Application Support/go-fish/attempts.txt`) that
+  sleeps 0 s, 1 s, then 2 s before consecutive permission preflights,
+  and after the 3rd failure exits with `0` so `SuccessfulExit=false`
+  doesn't restart it. A successful start resets the counter. Net
+  effect: a missing permission can never turn into a runaway restart
+  loop.
+
+The plist that gets written looks like this — useful to know if you're
+debugging or want to hand-edit fields:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -208,40 +254,25 @@ If you'd rather wire it up by hand, create
 <dict>
     <key>Label</key>
     <string>com.local.gofish</string>
-
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/go-fish</string>
+        <string>/Users/YOUR_USERNAME/Applications/go-fish</string>
     </array>
-
-    <key>RunAtLoad</key>
-    <true/>
-
-    <key>KeepAlive</key>
-    <true/>
-
-    <key>ProcessType</key>
-    <string>Interactive</string>
-
-    <key>StandardErrorPath</key>
-    <string>/Users/YOUR_USERNAME/Library/Logs/go-fish.err.log</string>
-
-    <key>StandardOutPath</key>
-    <string>/Users/YOUR_USERNAME/Library/Logs/go-fish.out.log</string>
+    <key>RunAtLoad</key>      <true/>
+    <key>KeepAlive</key>      <dict><key>SuccessfulExit</key><false/></dict>
+    <key>ThrottleInterval</key><integer>30</integer>
+    <key>ProcessType</key>    <string>Interactive</string>
+    <key>StandardOutPath</key><string>/Users/YOUR_USERNAME/Library/Logs/go-fish.out.log</string>
+    <key>StandardErrorPath</key><string>/Users/YOUR_USERNAME/Library/Logs/go-fish.err.log</string>
 </dict>
 </plist>
 ```
 
-Then:
+Manual control of the same plist:
 
 ```sh
 launchctl load -w ~/Library/LaunchAgents/com.local.gofish.plist
-```
-
-Stop or unload with:
-
-```sh
-launchctl unload ~/Library/LaunchAgents/com.local.gofish.plist
+launchctl unload   ~/Library/LaunchAgents/com.local.gofish.plist
 ```
 
 ## Resource footprint
@@ -275,7 +306,33 @@ Disable it (see "Disable the system Cmd+Tab" above).
   & Security → Accessibility). The toggle must be **on** for `go-fish`.
 - If you re-signed or rebuilt the binary, macOS may consider it a new app
   and silently revoke the permission until you re-grant it.
-- Check `/tmp/go-fish.err.log` if running under a LaunchAgent.
+- Check `~/Library/Logs/go-fish.err.log` (where the binary's stderr
+  goes when running under a LaunchAgent, and also when started via
+  `open` from Finder).
+
+### Cmd+Tab silently does nothing (system switcher also doesn't appear)
+
+Almost certainly **Secure Event Input** is active. macOS routes
+keyboard events past every third-party event tap when an app has
+asserted secure input — Terminal during `sudo`/`ssh`, password managers
+while filling, some VPN clients during auth, Citrix / Microsoft Remote
+Desktop, and Zoom remote-control sessions are the common offenders.
+
+If the **Secure Event Input detection** menu item is checked (default),
+the menu-bar icon shows a red X overlay during these periods and the
+tooltip says so explicitly. Verify which process is holding it:
+
+```sh
+ioreg -l -w 0 | grep -i "kCGSSessionSecureInputPID"
+# then map the PID to a process:
+ps -p <pid>
+```
+
+There's no programmatic workaround inside go-fish — Apple intentionally
+makes secure input un-bypassable, even for HID-level taps. Move focus
+off the secure-input source (click a different window) or quit the
+holding app to clear it. Terminal in particular is known to occasionally
+leak secure input after `sudo`; relaunching Terminal clears it.
 
 ### Thumbnails are missing / all entries show app icons
 

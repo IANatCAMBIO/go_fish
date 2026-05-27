@@ -1,20 +1,22 @@
 #!/usr/bin/env zsh
-# install.sh — install go-fish as a per-user LaunchAgent.
+# install.sh — install go-fish as a user binary in ~/Applications.
 #
 # Usage:
 #   ./install.sh              install or refresh using ./bin/go-fish
 #   ./install.sh --build      compile from ./src first, then install
 #                             (requires Go + Xcode Command Line Tools)
-#   ./install.sh uninstall    stop and remove
+#   ./install.sh uninstall    full teardown: stop process, remove
+#                             LaunchAgent (if present), remove binary
+#
+# Install does NOT register a LaunchAgent — go-fish runs as a normal
+# foreground binary you launch yourself (`open ~/Applications/go-fish`
+# or double-click). Auto-start at login is opt-in via the "Start at
+# boot" menu item, which writes ~/Library/LaunchAgents/com.local.gofish.plist
+# on demand.
 #
 # Build flow: `go build` runs inside ./src and writes the binary to
-# ./bin/go-fish. Install copies that file to /usr/local/bin/go-fish (the
-# macOS-conventional location for user-installed binaries — /usr/bin is
-# SIP-protected and not writable). The LaunchAgent plist goes in
-# ~/Library/LaunchAgents and points at the system copy.
-#
-# Idempotent: re-running re-installs cleanly. The previous LaunchAgent is
-# unloaded before the new binary is dropped in.
+# ./bin/go-fish. Install copies that file to ~/Applications/go-fish.
+# No sudo required.
 
 set -euo pipefail
 
@@ -25,9 +27,8 @@ SRC_DIR="${SCRIPT_DIR}/src"
 LOCAL_BIN_DIR="${SCRIPT_DIR}/bin"
 LOCAL_BIN="${LOCAL_BIN_DIR}/go-fish"
 
-# /usr/bin is SIP-protected on macOS; /usr/local/bin is the standard
-# location for user-installed binaries and is writable with sudo.
-INSTALL_DIR="/usr/local/bin"
+# User-writable, conventional spot for per-user apps/binaries.
+INSTALL_DIR="${HOME}/Applications"
 INSTALL_PATH="${INSTALL_DIR}/go-fish"
 
 LAUNCHAGENT_DIR="${HOME}/Library/LaunchAgents"
@@ -35,6 +36,12 @@ PLIST_PATH="${LAUNCHAGENT_DIR}/${LABEL}.plist"
 LOG_DIR="${HOME}/Library/Logs"
 STDOUT_LOG="${LOG_DIR}/go-fish.out.log"
 STDERR_LOG="${LOG_DIR}/go-fish.err.log"
+SUPPORT_DIR="${HOME}/Library/Application Support/go-fish"
+
+# Default cache override avoids the root-owned ~/Library/Caches/go-build
+# trap when this repo has been built under sudo at some point.
+: ${GOCACHE:=/tmp/go-fish-cache}
+export GOCACHE
 
 # --- argument parsing -------------------------------------------------
 do_build=false
@@ -55,11 +62,15 @@ for arg in "$@"; do
     esac
 done
 
-unload_if_present() {
+stop_running() {
+    # Best-effort: unload any registered LaunchAgent (so it can't crash-restart
+    # while we're swapping binaries), then kill any standalone process.
     if [[ -f "${PLIST_PATH}" ]]; then
-        # Suppress errors: it's fine if it wasn't loaded.
         launchctl unload "${PLIST_PATH}" 2>/dev/null || true
     fi
+    launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
+    pkill -f "${INSTALL_PATH}" 2>/dev/null || true
+    pkill -x "go-fish" 2>/dev/null || true
 }
 
 case "${action}" in
@@ -76,96 +87,86 @@ install)
         exit 1
     fi
 
-    # Ad-hoc sign in place. Doing this on the local copy means the
-    # signature travels with the file to /usr/local/bin so we don't need a
-    # second sudo'd codesign run there.
+    # Ad-hoc sign in place so the signature travels with the file when we
+    # copy it to ~/Applications. Note: ad-hoc re-signing on every build
+    # changes the code identity, which makes macOS revoke previously-granted
+    # Accessibility / Screen Recording. You'll need to re-approve in System
+    # Settings after each build. The new "Start at boot" backoff (3-attempt
+    # cap inside the binary) keeps that from turning into a launchd loop.
     echo "Ad-hoc signing ${LOCAL_BIN}..."
     codesign --force --sign - "${LOCAL_BIN}"
 
-    mkdir -p "${LAUNCHAGENT_DIR}" "${LOG_DIR}"
-    unload_if_present
+    stop_running
 
-    echo "Installing to ${INSTALL_PATH} (you'll be prompted for sudo)..."
-    sudo mkdir -p "${INSTALL_DIR}"
-    sudo cp "${LOCAL_BIN}" "${INSTALL_PATH}"
-    sudo chmod 755 "${INSTALL_PATH}"
+    mkdir -p "${INSTALL_DIR}" "${LOG_DIR}" "${SUPPORT_DIR}"
+    echo "Installing to ${INSTALL_PATH}..."
+    cp "${LOCAL_BIN}" "${INSTALL_PATH}"
+    chmod 755 "${INSTALL_PATH}"
 
-    echo "Writing LaunchAgent plist to ${PLIST_PATH}"
-    cat > "${PLIST_PATH}" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>${LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${INSTALL_PATH}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-    <key>ProcessType</key>
-    <string>Interactive</string>
-    <key>StandardOutPath</key>
-    <string>${STDOUT_LOG}</string>
-    <key>StandardErrorPath</key>
-    <string>${STDERR_LOG}</string>
-</dict>
-</plist>
-EOF
-
-    echo "Loading LaunchAgent..."
-    launchctl load -w "${PLIST_PATH}"
+    # Reset any stale attempt counter from a prior crash loop.
+    : > "${SUPPORT_DIR}/attempts.txt"
 
     cat <<EOF
 
-go-fish installed and running.
+go-fish installed.
   binary:  ${INSTALL_PATH}
-  plist:   ${PLIST_PATH}
   logs:    ${STDERR_LOG}
            ${STDOUT_LOG}
 
-Next steps:
-  1. System Settings > Privacy & Security > Accessibility
-     and Screen Recording — make sure ${INSTALL_PATH} is enabled.
-  2. On macOS 13+, System Settings > General > Login Items & Extensions
-     — confirm go-fish is allowed in the background.
-  3. System Settings > Keyboard > Keyboard Shortcuts —
-     disable the system Cmd+Tab (Mission Control) and Cmd+\` ("Move focus
-     to next window in active app") so go-fish gets the keystrokes first.
+To start it now:
+  open ${INSTALL_PATH}
+  (or double-click ${INSTALL_PATH} in Finder)
 
-Useful commands:
-  launchctl list | grep ${LABEL}
-  tail -f ${STDERR_LOG}
-  ${0:t} uninstall
+The first launch will prompt for Accessibility + Screen Recording
+permissions. Grant both, then re-launch.
+
+Toggle "Start at boot" from the menu-bar icon to have go-fish come
+back automatically at login.
+
+System Settings > Keyboard > Keyboard Shortcuts:
+  - Disable Mission Control's Cmd+Tab
+  - Disable "Move focus to next window in active app" (Cmd+\`)
+  so go-fish gets the keystrokes first.
+
+Uninstall: ${0:t} uninstall
 EOF
     ;;
 
 uninstall)
-    # Stop any running instance. Try both the legacy (unload) and modern
-    # (bootout) paths; either may already be a no-op, which is fine.
-    if [[ -e "${PLIST_PATH}" ]]; then
-        echo "Unloading LaunchAgent..."
-        launchctl unload "${PLIST_PATH}" 2>/dev/null || true
-    fi
-    launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
+    echo "Stopping any running go-fish..."
+    stop_running
 
-    # Remove the plist unconditionally — rm -f is a no-op if it's missing,
-    # and this catches edge cases where a previous run left it orphaned.
     if [[ -e "${PLIST_PATH}" ]]; then
         echo "Removing ${PLIST_PATH}"
+        rm -f "${PLIST_PATH}"
     fi
-    rm -f "${PLIST_PATH}"
 
-    # Remove the system binary.
     if [[ -e "${INSTALL_PATH}" ]]; then
-        echo "Removing ${INSTALL_PATH} (you'll be prompted for sudo)"
-        sudo rm -f "${INSTALL_PATH}"
+        echo "Removing ${INSTALL_PATH}"
+        rm -f "${INSTALL_PATH}"
+    fi
+
+    # Best-effort: also clean up the legacy /usr/local/bin install path
+    # from earlier versions, so a fresh install can't be shadowed by a
+    # stale binary on PATH.
+    if [[ -e /usr/local/bin/go-fish ]]; then
+        echo "Removing legacy /usr/local/bin/go-fish (sudo required)"
+        sudo rm -f /usr/local/bin/go-fish || true
+    fi
+
+    if [[ -d "${SUPPORT_DIR}" ]]; then
+        echo "Removing ${SUPPORT_DIR}"
+        rm -rf "${SUPPORT_DIR}"
+    fi
+
+    # Logs: prompt, default no.
+    if [[ -e "${STDOUT_LOG}" || -e "${STDERR_LOG}" ]]; then
+        printf "Also remove logs at %s{out,err}.log? [y/N] " "${LOG_DIR}/go-fish."
+        read -r ans
+        case "${ans}" in
+            y|Y|yes|YES) rm -f "${STDOUT_LOG}" "${STDERR_LOG}" ;;
+            *) echo "Keeping logs." ;;
+        esac
     fi
 
     echo "go-fish uninstalled."

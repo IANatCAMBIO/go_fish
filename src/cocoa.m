@@ -2,22 +2,41 @@
 //
 // Responsibilities:
 //   - NSApplication lifecycle (gf_run).
-//   - Global CGEventTap intercepting Cmd+Tab / flag changes / Escape.
-//   - Window enumeration via the Accessibility API (covers minimized windows).
-//   - Thumbnail capture via CGWindowListCreateImage (still works as of macOS 14;
-//     deprecation warning suppressed at the Go cgo level).
+//   - Global CGEventTap intercepting Cmd+Tab / Cmd+` / flag changes / Escape.
+//   - Window enumeration via the Accessibility API (covers minimized windows),
+//     parallelized across apps via dispatch_apply so total latency scales with
+//     max(per-app), not the sum across every running app.
+//   - Thumbnail capture via CGWindowListCreateImage, resolved at runtime via
+//     dlsym (the symbol was obsoleted in the macOS 15 SDK headers but still
+//     ships in CoreGraphics). Future: migrate to ScreenCaptureKit.
 //   - The borderless floating NSPanel that draws the grid.
 //   - Window activation via AX (handles un-minimize + raise; the system
 //     switches Spaces when the owning app is activated).
+//   - Bulk window arrangement: gf_minimizeAll / gf_cascadeAll.
+//   - Menu-bar status item + dropdown menu: Show Window Grid, Minimize All,
+//     Cascade All, Start at boot, Secure Event Input detection, Quit.
+//   - MRU tracker fed by NSWorkspaceDidActivateApplicationNotification plus
+//     per-app AXObserver focused-window-changed callbacks.
+//   - LaunchAgent management for the "Start at boot" toggle: writes /
+//     removes ~/Library/LaunchAgents/com.local.gofish.plist pointing at the
+//     running binary's resolved path. Effective on next login; we don't
+//     launchctl-load now to avoid duplicate instances under launchd.
+//   - Secure Event Input poller (1.5 s NSTimer) backing the SEI menu toggle.
+//     When another app holds Secure Event Input, every third-party CGEventTap
+//     is bypassed by macOS — so we paint a red-X overlay on the menu-bar icon
+//     and update the tooltip to surface that go-fish is temporarily unavailable.
 
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <CoreGraphics/CoreGraphics.h>
 #include "cocoa.h"
 #include <dlfcn.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 // CGWindowListCreateImage was obsoleted in the macOS 15 SDK headers, but the
 // symbol is still present in CoreGraphics at runtime. Load it dynamically so
@@ -25,9 +44,20 @@
 typedef CGImageRef (*gf_clci_t)(CGRect, uint32_t /*CGWindowListOption*/,
                                 CGWindowID, uint32_t /*CGWindowImageOption*/);
 static gf_clci_t gCGWindowListCreateImage = NULL;
+
+// IsSecureEventInputEnabled lives in Carbon/HIToolbox. HIToolbox is loaded
+// transitively by AppKit, so dlsym from RTLD_DEFAULT finds it without us
+// linking Carbon explicitly. When secure input is on, session-level event
+// taps cannot see keyboard events — Cmd+Tab bypasses go-fish.
+typedef unsigned char (*gf_seien_t)(void);
+static gf_seien_t gIsSecureEventInputEnabled = NULL;
+
 static void gf_loadSymbols(void) {
     if (!gCGWindowListCreateImage) {
         gCGWindowListCreateImage = (gf_clci_t)dlsym(RTLD_DEFAULT, "CGWindowListCreateImage");
+    }
+    if (!gIsSecureEventInputEnabled) {
+        gIsSecureEventInputEnabled = (gf_seien_t)dlsym(RTLD_DEFAULT, "IsSecureEventInputEnabled");
     }
 }
 
@@ -56,6 +86,11 @@ static GFPanelView *gPanelView = nil;
 @class GFStatusHandler;
 static NSStatusItem    *gStatusItem    = nil;
 static GFStatusHandler *gStatusHandler = nil;
+static NSImage         *gIconNormal    = nil;  // template silhouette
+static NSImage         *gIconSEI       = nil;  // composite with red X
+static NSTimer         *gSEITimer      = nil;
+static atomic_int       gSEIDetection  = 1;    // user preference
+static atomic_int       gSEIActive     = 0;    // last observed state
 
 @class GFMRUTracker;
 static NSMutableArray<NSNumber *>            *gMRU         = nil;  // CGWindowIDs, front-to-back MRU
@@ -175,11 +210,38 @@ static void gf_ensureCap(gf_window_t **buf, int *cap, int needed) {
     *cap = newCap;
 }
 
+// Pending entry: everything we collect per-window in the worker, minus the
+// final zOrder. zOrder is assigned in the single-threaded merge phase so
+// the global fallbackZ counter stays deterministic (same ordering as the
+// pre-parallel implementation).
+typedef struct {
+    int            pid;
+    AXUIElementRef axRef;       // retained +1; NULL for unresponsive placeholder
+    CGWindowID     windowID;
+    char          *title;       // malloc'd, ownership transfers to caller
+    char          *appName;     // malloc'd, ownership transfers to caller
+    int            minimized;
+    int            onScreen;
+    int            unresponsive;
+    NSInteger      mruPos;      // NSNotFound if not in MRU
+    int            cgOrder;     // -1 if not in cgIndex (off-screen / minimized)
+} gf_pending_t;
+
+typedef struct {
+    gf_pending_t *items;
+    int           count;
+    int           cap;
+} gf_slot_t;
+
 gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
     *out_count = 0;
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
     @autoreleasepool {
         // CGWindowID -> front-to-back-index map for sort + on-screen test.
-        NSMutableDictionary<NSNumber *, NSNumber *> *cgIndex = [NSMutableDictionary dictionary];
+        // Built once on the calling thread, then read concurrently from
+        // workers. Copy to an immutable NSDictionary so concurrent reads
+        // are documented-safe.
+        NSMutableDictionary<NSNumber *, NSNumber *> *cgIndexM = [NSMutableDictionary dictionary];
         CFArrayRef cgList = CGWindowListCopyWindowInfo(
             kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
             kCGNullWindowID);
@@ -190,18 +252,30 @@ gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
                 NSNumber *layer = info[(id)kCGWindowLayer];
                 if (layer.intValue != 0) continue;
                 NSNumber *wid = info[(id)kCGWindowNumber];
-                if (wid && !cgIndex[wid]) cgIndex[wid] = @((int)i);
+                if (wid && !cgIndexM[wid]) cgIndexM[wid] = @((int)i);
             }
             CFRelease(cgList);
         }
+        NSDictionary<NSNumber *, NSNumber *> *cgIndex = [cgIndexM copy];
 
-        // Grow a single C buffer directly — no NSDictionary intermediate.
-        int cap = 0, count = 0;
-        gf_window_t *out = NULL;
-        gf_ensureCap(&out, &cap, 32);
+        // Snapshot MRU into a winID -> index dict so workers can do O(1)
+        // lookups without touching the mutable gMRU array (which the main
+        // thread may rewrite via gf_pushMRU).
+        NSDictionary<NSNumber *, NSNumber *> *mruIndex;
+        {
+            NSMutableDictionary<NSNumber *, NSNumber *> *m =
+                [NSMutableDictionary dictionaryWithCapacity:gMRU.count];
+            [gMRU enumerateObjectsUsingBlock:^(NSNumber *wid, NSUInteger idx, BOOL *_) {
+                m[wid] = @(idx);
+            }];
+            mruIndex = [m copy];
+        }
 
-        int fallbackZ = 0;
-        NSArray<NSRunningApplication *> *apps = [[NSWorkspace sharedWorkspace] runningApplications];
+        // Filter the running-apps list down to what we'll actually query.
+        NSArray<NSRunningApplication *> *apps =
+            [[NSWorkspace sharedWorkspace] runningApplications];
+        NSMutableArray<NSRunningApplication *> *targetsM =
+            [NSMutableArray arrayWithCapacity:apps.count];
         for (NSRunningApplication *app in apps) {
             pid_t pid = app.processIdentifier;
             if (filterPID != 0) {
@@ -209,119 +283,171 @@ gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
             } else if (app.activationPolicy != NSApplicationActivationPolicyRegular) {
                 continue;
             }
-            AXUIElementRef axApp = AXUIElementCreateApplication(pid);
-            if (!axApp) continue;
+            [targetsM addObject:app];
+        }
+        NSArray<NSRunningApplication *> *targets = [targetsM copy];
+        NSUInteger napps = targets.count;
+        if (napps == 0) return NULL;
 
-            // Cap AX messaging time on this app so an unresponsive process
-            // can't stall the panel. The same timeout propagates to child
-            // window elements queried through axApp.
-            AXUIElementSetMessagingTimeout(axApp, kAXAppTimeout);
+        // Per-app result slots. Each worker owns one slot — no sharing.
+        gf_slot_t *slots = (gf_slot_t *)calloc(napps, sizeof(gf_slot_t));
 
-            CFArrayRef axWins = NULL;
-            AXError err = AXUIElementCopyAttributeValue(
-                axApp, kAXWindowsAttribute, (CFTypeRef *)&axWins);
+        // Parallelize the per-app AX queries. AX calls on distinct
+        // AXUIElementRefs are safe to call concurrently, and each worker
+        // creates its own per-app ref. dispatch_apply blocks the caller
+        // until all iterations finish, so slots[] is fully populated
+        // before the merge.
+        dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
+        dispatch_apply(napps, q, ^(size_t i) {
+            @autoreleasepool {
+                NSRunningApplication *app = targets[i];
+                pid_t pid = app.processIdentifier;
+                gf_slot_t *s = &slots[i];
 
-            if (err == kAXErrorCannotComplete) {
-                // App didn't respond in time. Add a single placeholder so the
-                // user can still see and (best-effort) activate it.
-                if (app.localizedName.length == 0) {
+                AXUIElementRef axApp = AXUIElementCreateApplication(pid);
+                if (!axApp) return;
+                AXUIElementSetMessagingTimeout(axApp, kAXAppTimeout);
+
+                CFArrayRef axWins = NULL;
+                AXError err = AXUIElementCopyAttributeValue(
+                    axApp, kAXWindowsAttribute, (CFTypeRef *)&axWins);
+
+                if (err == kAXErrorCannotComplete) {
+                    // Unresponsive: contribute a placeholder so the user
+                    // can still see (and best-effort activate) the app.
+                    if (app.localizedName.length == 0) {
+                        CFRelease(axApp);
+                        return;
+                    }
+                    s->items = (gf_pending_t *)calloc(1, sizeof(gf_pending_t));
+                    s->cap = 1; s->count = 1;
+                    gf_pending_t *p = &s->items[0];
+                    p->pid          = (int)pid;
+                    p->axRef        = NULL;
+                    p->windowID     = 0;
+                    p->title        = strdup([app.localizedName UTF8String]);
+                    p->appName      = strdup([app.localizedName UTF8String]);
+                    p->minimized    = 0;
+                    p->onScreen     = 1;
+                    p->unresponsive = 1;
+                    p->mruPos       = NSNotFound;
+                    p->cgOrder      = -1;
                     CFRelease(axApp);
-                    continue;
+                    return;
                 }
+                if (err != kAXErrorSuccess || !axWins) {
+                    CFRelease(axApp);
+                    return;
+                }
+
+                CFIndex wc = CFArrayGetCount(axWins);
+                s->items = (gf_pending_t *)calloc((size_t)wc, sizeof(gf_pending_t));
+                s->cap   = (int)wc;
+
+                for (CFIndex j = 0; j < wc; j++) {
+                    AXUIElementRef w = (AXUIElementRef)CFArrayGetValueAtIndex(axWins, j);
+
+                    // Minimized state first: minimized windows always pass
+                    // the subrole filter below, since some apps return them
+                    // with a non-standard (or absent) subrole once minimized.
+                    CFTypeRef minRef = NULL;
+                    AXUIElementCopyAttributeValue(w, kAXMinimizedAttribute, &minRef);
+                    BOOL minimized = NO;
+                    if (minRef) {
+                        minimized = CFBooleanGetValue((CFBooleanRef)minRef);
+                        CFRelease(minRef);
+                    }
+
+                    if (!minimized) {
+                        CFTypeRef subroleRef = NULL;
+                        AXUIElementCopyAttributeValue(w, kAXSubroleAttribute, &subroleRef);
+                        NSString *subrole = (__bridge_transfer NSString *)subroleRef;
+                        if (subrole && ![subrole isEqualToString:(NSString *)kAXStandardWindowSubrole]) continue;
+                    }
+
+                    CFTypeRef titleRef = NULL;
+                    AXUIElementCopyAttributeValue(w, kAXTitleAttribute, &titleRef);
+                    NSString *title = (__bridge_transfer NSString *)titleRef;
+                    if (!title) title = @"";
+
+                    CGWindowID winID = 0;
+                    _AXUIElementGetWindow(w, &winID);
+
+                    NSNumber *order  = winID ? cgIndex[@(winID)]  : nil;
+                    NSNumber *mruIdx = winID ? mruIndex[@(winID)] : nil;
+                    BOOL onScreen = (order != nil) && !minimized;
+
+                    if (title.length == 0 && app.localizedName.length == 0) continue;
+
+                    NSString *displayTitle = title.length > 0 ? title : app.localizedName;
+                    NSString *displayApp   = app.localizedName ?: @"";
+
+                    gf_pending_t *p = &s->items[s->count];
+                    p->pid          = (int)pid;
+                    p->axRef        = (AXUIElementRef)CFRetain(w);
+                    p->windowID     = winID;
+                    p->title        = strdup([displayTitle UTF8String]);
+                    p->appName      = strdup([displayApp UTF8String]);
+                    p->minimized    = minimized ? 1 : 0;
+                    p->onScreen     = onScreen  ? 1 : 0;
+                    p->unresponsive = 0;
+                    p->mruPos       = mruIdx ? (NSInteger)mruIdx.unsignedIntegerValue : NSNotFound;
+                    p->cgOrder      = order ? order.intValue : -1;
+                    s->count++;
+                }
+                CFRelease(axWins);
+                CFRelease(axApp);
+            }
+        });
+
+        // Merge phase: walk slots in app order, assign zOrder using the
+        // global fallbackZ counter. Same ordering as the pre-parallel impl.
+        int cap = 0, count = 0, fallbackZ = 0;
+        gf_window_t *out = NULL;
+        gf_ensureCap(&out, &cap, 32);
+        for (NSUInteger i = 0; i < napps; i++) {
+            gf_slot_t *s = &slots[i];
+            for (int j = 0; j < s->count; j++) {
+                gf_pending_t *p = &s->items[j];
                 gf_ensureCap(&out, &cap, count + 1);
                 gf_window_t *e = &out[count];
-                e->pid          = (int)pid;
-                e->axRef        = NULL;
-                e->windowID     = 0;
-                e->title        = strdup([app.localizedName UTF8String]);
-                e->appName      = strdup([app.localizedName UTF8String]);
-                e->minimized    = 0;
-                e->onScreen     = 1;
-                e->zOrder       = 900000 + fallbackZ;
-                e->unresponsive = 1;
-                count++;
-                fallbackZ++;
-                CFRelease(axApp);
-                continue;
-            }
-            if (err != kAXErrorSuccess || !axWins) {
-                CFRelease(axApp);
-                continue;
-            }
-            CFIndex wc = CFArrayGetCount(axWins);
-            for (CFIndex i = 0; i < wc; i++) {
-                AXUIElementRef w = (AXUIElementRef)CFArrayGetValueAtIndex(axWins, i);
+                e->pid          = p->pid;
+                e->axRef        = (void *)p->axRef;
+                e->windowID     = p->windowID;
+                e->title        = p->title;     // ownership moves to out
+                e->appName      = p->appName;   // ownership moves to out
+                e->minimized    = p->minimized;
+                e->onScreen     = p->onScreen;
+                e->unresponsive = p->unresponsive;
 
-                // Read minimized state up front: minimized windows always pass
-                // the subrole filter below, since some apps return them with
-                // a non-standard subrole (or no subrole at all) once minimized.
-                CFTypeRef minRef = NULL;
-                AXUIElementCopyAttributeValue(w, kAXMinimizedAttribute, &minRef);
-                BOOL minimized = NO;
-                if (minRef) {
-                    minimized = CFBooleanGetValue((CFBooleanRef)minRef);
-                    CFRelease(minRef);
-                }
-
-                if (!minimized) {
-                    CFTypeRef subroleRef = NULL;
-                    AXUIElementCopyAttributeValue(w, kAXSubroleAttribute, &subroleRef);
-                    NSString *subrole = (__bridge_transfer NSString *)subroleRef;
-                    if (subrole && ![subrole isEqualToString:(NSString *)kAXStandardWindowSubrole]) continue;
-                }
-
-                CFTypeRef titleRef = NULL;
-                AXUIElementCopyAttributeValue(w, kAXTitleAttribute, &titleRef);
-                NSString *title = (__bridge_transfer NSString *)titleRef;
-                if (!title) title = @"";
-
-                CGWindowID winID = 0;
-                _AXUIElementGetWindow(w, &winID);
-
-                NSNumber *order = winID ? cgIndex[@(winID)] : nil;
-                BOOL onScreen = (order != nil) && !minimized;
-
-                // Sort key: MRU position first, then z-order, then minimized.
-                NSInteger mruPos = (winID && gMRU) ? [gMRU indexOfObject:@(winID)] : NSNotFound;
                 int zOrder;
-                if (mruPos != NSNotFound) {
-                    zOrder = (int)mruPos;
-                } else if (order) {
-                    zOrder = 100000 + order.intValue;
-                } else if (minimized) {
+                if (p->unresponsive) {
+                    zOrder = 900000 + fallbackZ;
+                } else if (p->mruPos != NSNotFound) {
+                    zOrder = (int)p->mruPos;
+                } else if (p->cgOrder >= 0) {
+                    zOrder = 100000 + p->cgOrder;
+                } else if (p->minimized) {
                     zOrder = 300000 + fallbackZ;
                 } else {
                     zOrder = 200000 + fallbackZ;
                 }
+                e->zOrder = zOrder;
                 fallbackZ++;
-
-                if (title.length == 0 && app.localizedName.length == 0) continue;
-
-                NSString *displayTitle = title.length > 0 ? title : app.localizedName;
-                NSString *displayApp   = app.localizedName ?: @"";
-
-                gf_ensureCap(&out, &cap, count + 1);
-                gf_window_t *e = &out[count];
-                e->pid          = (int)pid;
-                e->axRef        = (void *)CFRetain(w);
-                e->windowID     = winID;
-                e->title        = strdup([displayTitle UTF8String]);
-                e->appName      = strdup([displayApp UTF8String]);
-                e->minimized    = minimized ? 1 : 0;
-                e->onScreen     = onScreen ? 1 : 0;
-                e->zOrder       = zOrder;
-                e->unresponsive = 0;
                 count++;
             }
-            CFRelease(axWins);
-            CFRelease(axApp);
+            free(s->items);
         }
+        free(slots);
 
         if (count == 0) {
             free(out);
             return NULL;
         }
         *out_count = count;
+        fprintf(stderr, "go-fish: enumerate %lu apps -> %d windows in %.1f ms\n",
+                (unsigned long)napps, count,
+                (CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
         return out;
     }
 }
@@ -1334,6 +1460,10 @@ static void gf_uninstallObserverForPID(pid_t pid) {
 - (void)appTerminated:(NSNotification *)note;
 @end
 
+// Forward decl so appActivated: can request an immediate SEI re-check.
+// Defined down with the rest of the SEI poller machinery.
+static void gf_pollSEI(void);
+
 @implementation GFMRUTracker
 
 - (void)appActivated:(NSNotification *)note {
@@ -1346,6 +1476,13 @@ static void gf_uninstallObserverForPID(pid_t pid) {
         gf_captureAsync(winID);
     }
     gf_installObserverForPID(pid); // in case it's a freshly-regular app
+
+    // App activation is the dominant trigger for Secure Event Input
+    // state changes — most SEI-holding apps assert it as part of
+    // becoming active (or release it on resign). Re-poll immediately
+    // so the red-X overlay flips inside one runloop tick instead of
+    // waiting up to the next gSEITimer fire.
+    gf_pollSEI();
 }
 
 - (void)appLaunched:(NSNotification *)note {
@@ -1409,11 +1546,19 @@ static void gf_setupMRUTracking(void) {
 // =========================================================================
 
 @interface GFStatusHandler : NSObject
+@property (nonatomic, weak) NSMenuItem *seiItem;
+@property (nonatomic, weak) NSMenuItem *bootItem;
 - (void)showGrid:(id)sender;
 - (void)minimizeAll:(id)sender;
 - (void)cascadeAll:(id)sender;
+- (void)toggleSEIDetection:(id)sender;
+- (void)toggleStartAtBoot:(id)sender;
 - (void)quit:(id)sender;
 @end
+
+static void gf_startSEITimer(void);
+static void gf_stopSEITimer(void);
+static void gf_applySEIState(BOOL active);
 
 @implementation GFStatusHandler
 - (void)showGrid:(id)sender {
@@ -1424,10 +1569,164 @@ static void gf_setupMRUTracking(void) {
 }
 - (void)minimizeAll:(id)sender { gf_minimizeAll(); }
 - (void)cascadeAll:(id)sender  { gf_cascadeAll();  }
+- (void)toggleSEIDetection:(id)sender {
+    int next = atomic_load(&gSEIDetection) ? 0 : 1;
+    atomic_store(&gSEIDetection, next);
+    [[NSUserDefaults standardUserDefaults] setBool:(next ? YES : NO)
+                                            forKey:@"SEIDetection"];
+    self.seiItem.state = next ? NSControlStateValueOn : NSControlStateValueOff;
+    if (next) {
+        gf_startSEITimer();
+    } else {
+        gf_stopSEITimer();
+        // Clear any "unavailable" indication that was showing.
+        gf_applySEIState(NO);
+    }
+}
+- (void)toggleStartAtBoot:(id)sender {
+    BOOL installed = gf_isLaunchAgentInstalled() ? YES : NO;
+    int rc = installed ? gf_uninstallLaunchAgent() : gf_installLaunchAgent();
+    if (rc != 0) {
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = installed
+            ? @"Couldn't remove the Start at boot LaunchAgent."
+            : @"Couldn't install the Start at boot LaunchAgent.";
+        alert.informativeText = @"See the go-fish stderr log for details.";
+        [alert runModal];
+    }
+    BOOL nowOn = gf_isLaunchAgentInstalled() ? YES : NO;
+    self.bootItem.state = nowOn ? NSControlStateValueOn : NSControlStateValueOff;
+    if (rc == 0 && nowOn != installed) {
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = nowOn
+            ? @"Start at boot enabled."
+            : @"Start at boot disabled.";
+        alert.informativeText = nowOn
+            ? @"go-fish will launch automatically on your next login. (No change to the currently-running instance.)"
+            : @"go-fish will not auto-launch on next login. The current instance keeps running until you quit it.";
+        [alert runModal];
+    }
+}
 - (void)quit:(id)sender {
     [NSApp terminate:nil];
 }
 @end
+
+// =========================================================================
+// LaunchAgent management ("Start at boot")
+// =========================================================================
+
+static NSString *const kLaunchAgentLabel = @"com.local.gofish";
+
+static NSString *gf_launchAgentPath(void) {
+    return [NSString stringWithFormat:@"%@/Library/LaunchAgents/%@.plist",
+            NSHomeDirectory(), kLaunchAgentLabel];
+}
+
+// Resolve the running binary's absolute path. _NSGetExecutablePath may
+// return a path with .. or symlinks; realpath flattens it so the plist
+// holds a stable, canonical reference.
+static NSString *gf_currentExecutablePath(void) {
+    char buf[PATH_MAX];
+    uint32_t size = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &size) != 0) return nil;
+    char resolved[PATH_MAX];
+    if (realpath(buf, resolved) != NULL) {
+        return [NSString stringWithUTF8String:resolved];
+    }
+    return [NSString stringWithUTF8String:buf];
+}
+
+int gf_isLaunchAgentInstalled(void) {
+    return [[NSFileManager defaultManager] fileExistsAtPath:gf_launchAgentPath()]
+        ? 1 : 0;
+}
+
+int gf_installLaunchAgent(void) {
+    NSString *exe = gf_currentExecutablePath();
+    if (exe.length == 0) {
+        fprintf(stderr, "go-fish: could not determine executable path for LaunchAgent\n");
+        return -1;
+    }
+
+    NSString *home      = NSHomeDirectory();
+    NSString *plistPath = gf_launchAgentPath();
+    NSString *laDir     = [home stringByAppendingPathComponent:@"Library/LaunchAgents"];
+    NSString *logDir    = [home stringByAppendingPathComponent:@"Library/Logs"];
+    NSString *stdoutLog = [logDir stringByAppendingPathComponent:@"go-fish.out.log"];
+    NSString *stderrLog = [logDir stringByAppendingPathComponent:@"go-fish.err.log"];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm createDirectoryAtPath:laDir  withIntermediateDirectories:YES attributes:nil error:nil];
+    [fm createDirectoryAtPath:logDir withIntermediateDirectories:YES attributes:nil error:nil];
+
+    // ThrottleInterval gives launchd a 30 s floor between successive
+    // launches. Combined with the in-binary 3-attempt cap (see main.go),
+    // a binary that can't pass its permission preflight will quietly
+    // give up rather than spiral.
+    NSDictionary *plist = @{
+        @"Label":             kLaunchAgentLabel,
+        @"ProgramArguments":  @[exe],
+        @"RunAtLoad":         @YES,
+        @"KeepAlive":         @{@"SuccessfulExit": @NO},
+        @"ThrottleInterval":  @30,
+        @"ProcessType":       @"Interactive",
+        @"StandardOutPath":   stdoutLog,
+        @"StandardErrorPath": stderrLog,
+    };
+
+    NSError *err = nil;
+    NSData *data = [NSPropertyListSerialization
+        dataWithPropertyList:plist
+                      format:NSPropertyListXMLFormat_v1_0
+                     options:0
+                       error:&err];
+    if (!data) {
+        fprintf(stderr, "go-fish: plist serialize failed: %s\n",
+                err.localizedDescription.UTF8String ?: "(unknown)");
+        return -1;
+    }
+    if (![data writeToFile:plistPath atomically:YES]) {
+        fprintf(stderr, "go-fish: failed to write %s\n", plistPath.UTF8String);
+        return -1;
+    }
+    fprintf(stderr, "go-fish: wrote %s — takes effect on next login.\n",
+            plistPath.UTF8String);
+    return 0;
+}
+
+int gf_uninstallLaunchAgent(void) {
+    NSString *plistPath = gf_launchAgentPath();
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:plistPath]) return 0;
+
+    // If we're currently running under launchd, schedule a bootout so we
+    // won't be relaunched. bootout is asynchronous and will terminate us;
+    // we run it via NSTask without waiting, then return so the menu item
+    // updates first. If we're standalone (parent is not launchd), skip
+    // bootout — there's nothing to detach from.
+    if (getppid() == 1) {
+        NSTask *task = [[NSTask alloc] init];
+        task.launchPath = @"/bin/launchctl";
+        task.arguments  = @[@"bootout",
+                            [NSString stringWithFormat:@"gui/%d/%@",
+                             getuid(), kLaunchAgentLabel]];
+        task.standardOutput = [NSPipe pipe];
+        task.standardError  = [NSPipe pipe];
+        NSError *e = nil;
+        [task launchAndReturnError:&e]; // fire-and-forget
+    }
+
+    NSError *err = nil;
+    if (![fm removeItemAtPath:plistPath error:&err]) {
+        fprintf(stderr, "go-fish: failed to remove %s: %s\n",
+                plistPath.UTF8String,
+                err.localizedDescription.UTF8String ?: "(unknown)");
+        return -1;
+    }
+    fprintf(stderr, "go-fish: removed %s\n", plistPath.UTF8String);
+    return 0;
+}
 
 // Build a template menu-bar image from arbitrary image bytes.
 //
@@ -1494,13 +1793,98 @@ static NSImage *gf_makeMenuIcon(const void *bytes, int len) {
     return icon;
 }
 
+// Build a "go-fish unavailable" composite: the silhouette in the current
+// appearance's label color, with a bright red X stroked on top. Non-template
+// so the red stays red regardless of menu-bar appearance.
+static NSImage *gf_makeSEIIcon(NSImage *base) {
+    if (!base) return nil;
+    NSSize sz = base.size;
+    NSImage *out = [NSImage imageWithSize:sz flipped:NO drawingHandler:^BOOL(NSRect _r) {
+        NSRect r = NSMakeRect(0, 0, sz.width, sz.height);
+        // Draw the silhouette, then tint it to labelColor via sourceAtop so
+        // the icon stays legible in both light and dark menu bars.
+        [base drawInRect:r];
+        [[NSColor labelColor] set];
+        NSRectFillUsingOperation(r, NSCompositingOperationSourceAtop);
+
+        // Red X overlay.
+        CGFloat pad = sz.width * 0.18;
+        CGFloat lw  = MAX(2.0, sz.width * 0.18);
+        NSBezierPath *p = [NSBezierPath bezierPath];
+        [p moveToPoint:NSMakePoint(pad, pad)];
+        [p lineToPoint:NSMakePoint(sz.width - pad, sz.height - pad)];
+        [p moveToPoint:NSMakePoint(sz.width - pad, pad)];
+        [p lineToPoint:NSMakePoint(pad, sz.height - pad)];
+        p.lineWidth    = lw;
+        p.lineCapStyle = NSLineCapStyleRound;
+        [[NSColor systemRedColor] setStroke];
+        [p stroke];
+        return YES;
+    }];
+    out.template = NO;
+    return out;
+}
+
+// Swap the status-item icon + tooltip to reflect whether Secure Event Input
+// is currently blocking go-fish.
+static void gf_applySEIState(BOOL active) {
+    atomic_store(&gSEIActive, active ? 1 : 0);
+    if (!gStatusItem) return;
+    if (active) {
+        gStatusItem.button.image   = gIconSEI ?: gIconNormal;
+        gStatusItem.button.toolTip = @"go-fish unavailable — Secure Event Input is active";
+    } else {
+        gStatusItem.button.image   = gIconNormal;
+        gStatusItem.button.toolTip = @"go-fish";
+    }
+}
+
+static void gf_pollSEI(void) {
+    if (!atomic_load(&gSEIDetection)) return;
+    if (!gIsSecureEventInputEnabled) return;
+    BOOL nowActive = gIsSecureEventInputEnabled() ? YES : NO;
+    BOOL wasActive = atomic_load(&gSEIActive) ? YES : NO;
+    if (nowActive != wasActive) gf_applySEIState(nowActive);
+}
+
+static void gf_startSEITimer(void) {
+    if (gSEITimer) return;
+    if (!gIsSecureEventInputEnabled) return;
+    // 500 ms covers the in-app cases that don't fire an activation event
+    // (Terminal entering `sudo`, password field gaining focus). App-
+    // activation triggers get near-instant feedback via the explicit
+    // re-poll in GFMRUTracker.appActivated:. IsSecureEventInputEnabled
+    // is a sub-millisecond syscall, so 2 Hz polling is free.
+    gSEITimer = [NSTimer scheduledTimerWithTimeInterval:0.5
+                                                 repeats:YES
+                                                   block:^(NSTimer *_t) { gf_pollSEI(); }];
+    // Run during menu tracking too, so the X appears/disappears while the
+    // user has the menu open.
+    [[NSRunLoop currentRunLoop] addTimer:gSEITimer forMode:NSRunLoopCommonModes];
+    // Fire once immediately so initial state is accurate.
+    gf_pollSEI();
+}
+
+static void gf_stopSEITimer(void) {
+    if (!gSEITimer) return;
+    [gSEITimer invalidate];
+    gSEITimer = nil;
+}
+
 static void installStatusItem(const void *iconBytes, int iconLen) {
     NSImage *icon = gf_makeMenuIcon(iconBytes, iconLen);
+    gIconNormal    = icon;
+    gIconSEI       = gf_makeSEIIcon(icon);
     gStatusHandler = [GFStatusHandler new];
     gStatusItem = [[NSStatusBar systemStatusBar]
         statusItemWithLength:NSVariableStatusItemLength];
     gStatusItem.button.image   = icon;
     gStatusItem.button.toolTip = @"go-fish";
+
+    // Restore the user's preference (default: enabled).
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults registerDefaults:@{@"SEIDetection": @YES}];
+    atomic_store(&gSEIDetection, [defaults boolForKey:@"SEIDetection"] ? 1 : 0);
 
     NSMenu *menu = [[NSMenu alloc] init];
     NSMenuItem *showItem = [[NSMenuItem alloc] initWithTitle:@"Show Window Grid"
@@ -1525,12 +1909,34 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
 
     [menu addItem:[NSMenuItem separatorItem]];
 
+    NSMenuItem *bootItem = [[NSMenuItem alloc] initWithTitle:@"Start at boot"
+                                                      action:@selector(toggleStartAtBoot:)
+                                               keyEquivalent:@""];
+    bootItem.target = gStatusHandler;
+    bootItem.state  = gf_isLaunchAgentInstalled()
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    gStatusHandler.bootItem = bootItem;
+    [menu addItem:bootItem];
+
+    NSMenuItem *seiItem = [[NSMenuItem alloc] initWithTitle:@"Secure Event Input detection"
+                                                     action:@selector(toggleSEIDetection:)
+                                              keyEquivalent:@""];
+    seiItem.target = gStatusHandler;
+    seiItem.state  = atomic_load(&gSEIDetection)
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    gStatusHandler.seiItem = seiItem;
+    [menu addItem:seiItem];
+
+    [menu addItem:[NSMenuItem separatorItem]];
+
     NSMenuItem *quitItem = [[NSMenuItem alloc] initWithTitle:@"Quit"
                                                       action:@selector(quit:)
                                                keyEquivalent:@"q"];
     quitItem.target = gStatusHandler;
     [menu addItem:quitItem];
     gStatusItem.menu = menu; // clicking the icon now pops this menu
+
+    if (atomic_load(&gSEIDetection)) gf_startSEITimer();
 }
 
 // =========================================================================

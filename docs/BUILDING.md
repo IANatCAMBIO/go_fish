@@ -139,7 +139,9 @@ Recording) once.
 ```
 go_fish/
 ├── README.md
-├── install.sh             # build / install / uninstall the LaunchAgent
+├── install.sh             # build / install (~/Applications/go-fish) / uninstall;
+│                          #   no LaunchAgent by default — that's opt-in via the
+│                          #   "Start at boot" menu item once go-fish is running
 ├── bin/
 │   └── go-fish            # prebuilt binary; --build writes here
 ├── docs/
@@ -147,10 +149,16 @@ go_fish/
 │   └── USAGE.md
 └── src/
     ├── go.mod             # module declaration, no third-party deps
-    ├── main.go            # entry point, permission checks, runs NSApp
+    ├── main.go            # entry point, permission preflight with 3-attempt
+    │                      #   backoff (attempts.txt), runs NSApp
     ├── switcher.go        # Go state machine; exports gfOnHotkey / gfOnCommit / gfOnCancel / gfSetSelection / gfOnClose to C
     ├── cocoa.h            # C interface between Go and Objective-C
-    ├── cocoa.m            # Cocoa: event tap, AX enumeration, panel UI, status item, MRU, thumbnail cache, activation, close, minimize-all / cascade-all
+    ├── cocoa.m            # Cocoa: event tap, parallelized AX enumeration,
+    │                      #   panel UI, status item + menu (Show / Minimize /
+    │                      #   Cascade / Start at boot / SEI detection / Quit),
+    │                      #   MRU, thumbnail cache, activation, close, bulk
+    │                      #   minimize / cascade, LaunchAgent install/uninstall,
+    │                      #   Secure Event Input poller + red-X icon overlay
     └── hook.png           # menu-bar icon, embedded via go:embed
 ```
 
@@ -159,9 +167,15 @@ go_fish/
 The Go ↔ Objective-C contract is small but worth knowing if you're
 editing either side:
 
-- `gf_enumerateWindows(out_count, filterPID)` — main snapshot call. Per
-  app, sets a 100 ms AX messaging timeout; unresponsive apps surface as
-  a single `unresponsive=1` entry with `axRef=NULL`.
+- `gf_enumerateWindows(out_count, filterPID)` — main snapshot call.
+  Parallelizes per-app AX queries via `dispatch_apply` on the global
+  `USER_INTERACTIVE` queue; each worker writes into its own pre-
+  allocated slot and a single-threaded merge phase assembles the output
+  buffer in stable app order so window ordering / `fallbackZ` are
+  identical to the pre-parallel implementation. Per-app messaging
+  timeout is 100 ms; unresponsive apps surface as a single
+  `unresponsive=1` entry with `axRef=NULL`. Emits a `go-fish: enumerate
+  N apps -> M windows in X.X ms` line to stderr on every call.
 - `gf_activateWindow(axRef, pid, minimized)` — un-minimize + raise +
   activate. Accepts `axRef=NULL` for unresponsive placeholders (falls
   back to app-only activation via `NSRunningApplication`).
@@ -175,6 +189,15 @@ editing either side:
 - `gf_updateSelection(selected)` — fast-path selection change. Dirties
   only the previously-selected and newly-selected cells so mouse-hover
   redraws stay cheap with large grids.
+- `gf_isLaunchAgentInstalled()` / `gf_installLaunchAgent()` /
+  `gf_uninstallLaunchAgent()` — backing the **Start at boot** menu
+  toggle. Install writes the plist (pointing at
+  `_NSGetExecutablePath()` resolved through `realpath`) but does *not*
+  `launchctl load` — we don't want to spawn a second instance under
+  launchd's management while one is already running. Uninstall removes
+  the plist; if the current process is itself running under launchd
+  (`getppid() == 1`), it also schedules a fire-and-forget `launchctl
+  bootout` so the agent detaches.
 
 The menu-bar icon is embedded into the binary at build time via a `go:embed`
 directive in `main.go`, so the resulting executable is fully self-contained —

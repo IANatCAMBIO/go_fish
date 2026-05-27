@@ -62,3 +62,17 @@ void gf_closeWindow(void *axRef);
 // gf_enumerateWindows uses).
 void gf_minimizeAll(void);
 void gf_cascadeAll(void);
+
+// LaunchAgent management for the "Start at boot" menu item.
+//   * gf_isLaunchAgentInstalled — does the per-user plist exist on disk
+//   * gf_installLaunchAgent     — write the plist pointing at the running
+//                                 binary's path. Effective on next login;
+//                                 we deliberately do not launchctl-load it
+//                                 now to avoid spawning a second instance.
+//   * gf_uninstallLaunchAgent   — remove the plist. If we're currently
+//                                 running under launchd, also bootout so
+//                                 we don't get re-launched after exit.
+// Return 0 on success, non-zero on failure.
+int  gf_isLaunchAgentInstalled(void);
+int  gf_installLaunchAgent(void);
+int  gf_uninstallLaunchAgent(void);
