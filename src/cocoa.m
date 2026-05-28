@@ -1670,8 +1670,33 @@ static NSString *gf_currentExecutablePath(void) {
 }
 
 int gf_isLaunchAgentInstalled(void) {
-    return [[NSFileManager defaultManager] fileExistsAtPath:gf_launchAgentPath()]
-        ? 1 : 0;
+    // File presence alone isn't enough: a stale plist from a previous
+    // install (e.g. one pointing at ~/salt_development/.../bin/go_fish
+    // while the user is now running ~/Applications/go_fish) would otherwise
+    // make the menu falsely report ON. We require the plist's
+    // ProgramArguments[0] to match the currently-running binary so the
+    // toggle reflects whether *this* binary will start at boot.
+    NSString *plistPath = gf_launchAgentPath();
+    NSData *data = [NSData dataWithContentsOfFile:plistPath];
+    if (!data) return 0;
+
+    id parsed = [NSPropertyListSerialization
+        propertyListWithData:data
+                     options:NSPropertyListImmutable
+                      format:NULL
+                       error:NULL];
+    if (![parsed isKindOfClass:[NSDictionary class]]) return 0;
+
+    NSArray *args = parsed[@"ProgramArguments"];
+    if (![args isKindOfClass:[NSArray class]] || args.count == 0) return 0;
+
+    NSString *plistExe = args[0];
+    if (![plistExe isKindOfClass:[NSString class]]) return 0;
+
+    NSString *currentExe = gf_currentExecutablePath();
+    if (currentExe.length == 0) return 0;
+
+    return [plistExe isEqualToString:currentExe] ? 1 : 0;
 }
 
 int gf_installLaunchAgent(void) {

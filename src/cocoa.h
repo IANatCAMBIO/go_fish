@@ -64,7 +64,12 @@ void gf_minimizeAll(void);
 void gf_cascadeAll(void);
 
 // LaunchAgent management for the "Start at boot" menu item.
-//   * gf_isLaunchAgentInstalled — does the per-user plist exist on disk
+//   * gf_isLaunchAgentInstalled — does the per-user plist exist AND point
+//                                 at the currently-running binary. A plist
+//                                 that targets a different path (e.g. a
+//                                 stale dev-build location) reports as not
+//                                 installed, so the menu reflects whether
+//                                 *this* binary will start at boot.
 //   * gf_installLaunchAgent     — write the plist pointing at the running
 //                                 binary's path. Effective on next login;
 //                                 we deliberately do not launchctl-load it

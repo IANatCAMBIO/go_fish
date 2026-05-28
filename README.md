@@ -57,10 +57,12 @@ the same app.
 ./install.sh uninstall
 ```
 
-After installing, launch go_fish (it does not start automatically):
+After installing, launch go_fish (it does not start automatically). For
+the first run, detach from the terminal so closing the shell doesn't
+kill the process and you don't get a noisy log stream:
 
 ```sh
-open ~/Applications/go_fish
+nohup ~/Applications/go_fish >/dev/null 2>&1 &
 ```
 
 The first launch will prompt for two permissions in **System Settings →
