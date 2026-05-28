@@ -1,24 +1,24 @@
-# Using go-fish
+# Using go_fish
 
-go-fish replaces the default macOS Cmd+Tab application switcher with a grid
+go_fish replaces the default macOS Cmd+Tab application switcher with a grid
 of window thumbnails — every window of every regular app, including
 minimized ones, each addressable individually.
 
 ## First run
 
-After `./install.sh` puts the binary at `~/Applications/go-fish`,
+After `./install.sh` puts the binary at `~/Applications/go_fish`,
 launch it:
 
 ```sh
-open ~/Applications/go-fish
+open ~/Applications/go_fish
 ```
 
-(Or double-click `go-fish` in Finder.) The installer does **not**
-register a LaunchAgent — go-fish runs as a normal foreground binary you
+(Or double-click `go_fish` in Finder.) The installer does **not**
+register a LaunchAgent — go_fish runs as a normal foreground binary you
 start yourself. Auto-launch on login is opt-in via the **Start at boot**
-menu item once go-fish is up.
+menu item once go_fish is up.
 
-On the first launch, go-fish needs two permissions and will exit with a
+On the first launch, go_fish needs two permissions and will exit with a
 message after each. Grant them in **System Settings → Privacy & Security**:
 
 1. **Accessibility** — required to read each app's window list, raise
@@ -29,7 +29,7 @@ message after each. Grant them in **System Settings → Privacy & Security**:
 
 If you launch before granting permissions, the binary will exit and
 write the failure to its attempt counter at
-`~/Library/Application Support/go-fish/attempts.txt`. The next two
+`~/Library/Application Support/go_fish/attempts.txt`. The next two
 launches add a 1 s and 2 s sleep before retrying; after a 3rd failed
 preflight, the binary exits *cleanly* (`exit 0`) — which matters under
 the LaunchAgent path because launchd's `SuccessfulExit=false` keep-alive
@@ -38,13 +38,13 @@ won't restart it. A successful start resets the counter.
 After granting both, re-launch. You should see:
 
 ```
-go-fish running. Press Cmd+Tab to switch windows, or click the hook in the menu bar.
-If the system switcher opens instead of go-fish, disable Cmd+Tab in
+go_fish running. Press Cmd+Tab to switch windows, or click the hook in the menu bar.
+If the system switcher opens instead of go_fish, disable Cmd+Tab in
 System Settings > Keyboard > Keyboard Shortcuts > Mission Control.
 ```
 
 A fishing-hook icon appears in the right side of the menu bar while
-go-fish is running. Click it to drop down a menu:
+go_fish is running. Click it to drop down a menu:
 
 - **Show Window Grid** — opens the all-apps grid (same as Cmd+Tab).
 - **Minimize All** — minimizes every standard window of every regular
@@ -56,7 +56,7 @@ go-fish is running. Click it to drop down a menu:
   top-left and every window's title bar stays visible. Apps that refuse
   AX position writes (fixed-UI Electron tools, full-screen apps that
   don't expose `AXFullScreen`, etc.) are skipped silently; the log file
-  (`~/Library/Logs/go-fish.err.log`) records which.
+  (`~/Library/Logs/go_fish.err.log`) records which.
 - **Start at boot** (toggle) — writes / removes
   `~/Library/LaunchAgents/com.local.gofish.plist` pointing at the
   running binary's resolved path. Effective on next login; the currently
@@ -65,20 +65,20 @@ go-fish is running. Click it to drop down a menu:
   the binary next time. See **Running in the background** below for the
   contract details.
 - **Secure Event Input detection** (toggle) — when checked (default),
-  go-fish polls `IsSecureEventInputEnabled()` every 1.5 s. While Secure
+  go_fish polls `IsSecureEventInputEnabled()` every 1.5 s. While Secure
   Event Input is held by another app, the menu-bar icon gets a red X
-  overlay and the tooltip changes to "go-fish unavailable — Secure
+  overlay and the tooltip changes to "go_fish unavailable — Secure
   Event Input is active". Cmd+Tab really *is* unavailable in that
   state — macOS routes keyboard events past every third-party event
   tap. See **Troubleshooting → Cmd+Tab silently does nothing** below.
-- **Quit** — terminates go-fish. The keyboard shortcut listed beside it
+- **Quit** — terminates go_fish. The keyboard shortcut listed beside it
   (⌘Q) only works while the menu is open; there's no key window
   otherwise.
 
 ## Disable the conflicting system shortcuts
 
 macOS has two built-in shortcuts that fire inside WindowServer **before**
-any third-party event tap can see them. Both need to be off for go-fish
+any third-party event tap can see them. Both need to be off for go_fish
 to receive the keystrokes reliably:
 
 1. **Cmd+Tab** (system app switcher) → **System Settings → Keyboard →
@@ -91,8 +91,8 @@ to receive the keystrokes reliably:
    window in active app" bound to ⌘\`, and uncheck it.
 
 You can leave either binding enabled if you only want one of the two
-go-fish shortcuts — they're independent. If a shortcut doesn't seem to
-trigger go-fish, the system binding is the first thing to check.
+go_fish shortcuts — they're independent. If a shortcut doesn't seem to
+trigger go_fish, the system binding is the first thing to check.
 
 ## Using the switcher
 
@@ -119,7 +119,7 @@ is up).
 
 When you commit:
 
-- If the chosen window is **minimized**, go-fish un-minimizes it (restoring
+- If the chosen window is **minimized**, go_fish un-minimizes it (restoring
   it to its last size and position) and brings it to the front.
 - If the chosen window is on **another Space or another display**, macOS
   automatically switches to that Space as a side-effect of activating the
@@ -167,11 +167,11 @@ Windows are ordered **most-recently-used first**, so:
   release without cycling — toggles between the last two windows you used.
 - Repeated quick Cmd+Tabs ping-pong between those two, the same way native
   Cmd+Tab does for apps.
-- Windows you've focused at any point during this go-fish session are
+- Windows you've focused at any point during this go_fish session are
   ordered by recency; windows that haven't been touched fall back to
   z-order, then off-Space, then minimized at the very end.
 
-MRU is rebuilt in memory each time go-fish starts (seeded from the current
+MRU is rebuilt in memory each time go_fish starts (seeded from the current
 z-order) and updated by listening to `NSWorkspaceDidActivateApplication`
 notifications plus per-app `kAXFocusedWindowChangedNotification`
 observers, so within-app window switches (clicking another window,
@@ -179,7 +179,7 @@ in-app Cmd+\`, etc.) also register.
 
 ## Configuration
 
-For now go-fish has no config file — the hotkey is fixed at **Cmd+Tab** by
+For now go_fish has no config file — the hotkey is fixed at **Cmd+Tab** by
 design (it's the slot you've chosen to replace). Future configuration
 points, if you want them:
 
@@ -199,25 +199,25 @@ To rebuild after editing, see `BUILDING.md`.
 
 ## Running in the background, always
 
-go-fish runs as an accessory app (no Dock icon by default; only the
+go_fish runs as an accessory app (no Dock icon by default; only the
 menu-bar hook) and idles at effectively zero CPU until you press the
 hotkey.
 
 ### Install
 
 ```sh
-./install.sh              # install the prebuilt ./bin/go-fish into ~/Applications/
-./install.sh --build      # compile ./src → ./bin/go-fish first (needs Go + Xcode CLT)
+./install.sh              # install the prebuilt ./bin/go_fish into ~/Applications/
+./install.sh --build      # compile ./src → ./bin/go_fish first (needs Go + Xcode CLT)
 ./install.sh uninstall    # full teardown: stops process, removes LaunchAgent
                           # (if any), removes the binary, optionally clears logs
 ```
 
 The installer **does not** register a LaunchAgent. It just builds
 (optional), ad-hoc signs, and copies the binary to
-`~/Applications/go-fish`. Launch it manually via `open
-~/Applications/go-fish` or by double-clicking in Finder.
+`~/Applications/go_fish`. Launch it manually via `open
+~/Applications/go_fish` or by double-clicking in Finder.
 
-`install.sh` exports `GOCACHE=/tmp/go-fish-cache` before building, which
+`install.sh` exports `GOCACHE=/tmp/go_fish-cache` before building, which
 sidesteps the root-owned `~/Library/Caches/go-build` trap that can
 appear on machines where `go build` was once run under `sudo`.
 
@@ -229,14 +229,14 @@ binary's resolved path. Contract:
 
 - **No effect on the currently running instance.** We deliberately do
   *not* `launchctl load` immediately — that would spawn a second
-  go-fish under launchd's management, fighting the first for the event
+  go_fish under launchd's management, fighting the first for the event
   tap. The plist takes effect on your next login.
-- **Unchecking** removes the plist. If go-fish is currently running
+- **Unchecking** removes the plist. If go_fish is currently running
   under launchd (`getppid() == 1`), it schedules a `launchctl bootout`
   so the agent is detached and won't relaunch the binary on exit.
 - **Crash-loop guard.** The plist sets `ThrottleInterval=30` (launchd's
   minimum gap between launches). The binary itself adds an attempt
-  counter (`~/Library/Application Support/go-fish/attempts.txt`) that
+  counter (`~/Library/Application Support/go_fish/attempts.txt`) that
   sleeps 0 s, 1 s, then 2 s before consecutive permission preflights,
   and after the 3rd failure exits with `0` so `SuccessfulExit=false`
   doesn't restart it. A successful start resets the counter. Net
@@ -256,14 +256,14 @@ debugging or want to hand-edit fields:
     <string>com.local.gofish</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/YOUR_USERNAME/Applications/go-fish</string>
+        <string>/Users/YOUR_USERNAME/Applications/go_fish</string>
     </array>
     <key>RunAtLoad</key>      <true/>
     <key>KeepAlive</key>      <dict><key>SuccessfulExit</key><false/></dict>
     <key>ThrottleInterval</key><integer>30</integer>
     <key>ProcessType</key>    <string>Interactive</string>
-    <key>StandardOutPath</key><string>/Users/YOUR_USERNAME/Library/Logs/go-fish.out.log</string>
-    <key>StandardErrorPath</key><string>/Users/YOUR_USERNAME/Library/Logs/go-fish.err.log</string>
+    <key>StandardOutPath</key><string>/Users/YOUR_USERNAME/Library/Logs/go_fish.out.log</string>
+    <key>StandardErrorPath</key><string>/Users/YOUR_USERNAME/Library/Logs/go_fish.err.log</string>
 </dict>
 </plist>
 ```
@@ -287,7 +287,7 @@ launchctl unload   ~/Library/LaunchAgents/com.local.gofish.plist
   ~25–30 MB at the cap). It's pre-warmed at startup (visible windows are
   captured serially over a few seconds at utility priority) and refreshed
   whenever a window gets focused, an app gets activated, or you activate
-  a window via go-fish itself. Cached entries older than 30 s get
+  a window via go_fish itself. Cached entries older than 30 s get
   re-captured in the background when the grid opens — the stale version
   is still displayed instantly while the refresh runs.
 - Window list is **not** maintained in memory between activations; it's
@@ -297,16 +297,16 @@ launchctl unload   ~/Library/LaunchAgents/com.local.gofish.plist
 
 ### Cmd+Tab still opens the system switcher
 
-WindowServer's built-in shortcut is taking the key before go-fish sees it.
+WindowServer's built-in shortcut is taking the key before go_fish sees it.
 Disable it (see "Disable the system Cmd+Tab" above).
 
 ### Panel doesn't appear, but the system one is disabled
 
 - Confirm Accessibility permission is granted (System Settings → Privacy
-  & Security → Accessibility). The toggle must be **on** for `go-fish`.
+  & Security → Accessibility). The toggle must be **on** for `go_fish`.
 - If you re-signed or rebuilt the binary, macOS may consider it a new app
   and silently revoke the permission until you re-grant it.
-- Check `~/Library/Logs/go-fish.err.log` (where the binary's stderr
+- Check `~/Library/Logs/go_fish.err.log` (where the binary's stderr
   goes when running under a LaunchAgent, and also when started via
   `open` from Finder).
 
@@ -328,7 +328,7 @@ ioreg -l -w 0 | grep -i "kCGSSessionSecureInputPID"
 ps -p <pid>
 ```
 
-There's no programmatic workaround inside go-fish — Apple intentionally
+There's no programmatic workaround inside go_fish — Apple intentionally
 makes secure input un-bypassable, even for HID-level taps. Move focus
 off the secure-input source (click a different window) or quit the
 holding app to clear it. Terminal in particular is known to occasionally
@@ -337,19 +337,19 @@ leak secure input after `sudo`; relaunching Terminal clears it.
 ### Thumbnails are missing / all entries show app icons
 
 Grant Screen Recording permission. After granting, you must quit and
-re-launch go-fish — macOS only re-checks the permission at process start.
+re-launch go_fish — macOS only re-checks the permission at process start.
 
 ### A window appears in the grid that I can't activate
 
 Some sandboxed apps return AX window elements that don't accept
-`kAXRaiseAction`. go-fish will still call `activateWithOptions:` on the
+`kAXRaiseAction`. go_fish will still call `activateWithOptions:` on the
 owning app, which usually brings *some* window of that app forward but may
 not be the exact one you selected. Known offender: certain Electron apps
 in unusual states.
 
 ### An app shows up as "not responding"
 
-The app didn't reply to go-fish's AX windows query within the per-app
+The app didn't reply to go_fish's AX windows query within the per-app
 budget (100 ms by default — see `kAXAppTimeout` in `cocoa.m`). The most
 common causes are an app stuck waiting on disk/network, mid-launch
 initialization, or an in-progress modal that hasn't fully realized. The
@@ -363,7 +363,7 @@ and choose Force Quit, or `kill <pid>` from a shell.
 `Cascade All` writes `kAXPositionAttribute` on each window, but some apps
 refuse position writes (fixed-UI tools, full-screen apps that don't
 expose `AXFullScreen`, certain Electron apps). Skipped windows are
-logged to `~/Library/Logs/go-fish.err.log` with their app name and the
+logged to `~/Library/Logs/go_fish.err.log` with their app name and the
 AX error code; a summary line at the end reports `moved N, resized M,
 skipped K of T`. Full-screen apps are best-effort un-fullscreened first
 (via the undocumented `AXFullScreen` attribute) — works for Safari,
@@ -378,11 +378,11 @@ different bytes, so a fresh CDHash, so macOS treats it as a new app and
 re-prompts.
 
 The System Settings UI shows one entry per path, so you'll see the
-go-fish row still toggled **on** — but that's the previous CDHash's
+go_fish row still toggled **on** — but that's the previous CDHash's
 grant. The OS is waiting on permission for the current binary.
 
 **To fix once:** in **System Settings → Privacy & Security → Accessibility**,
-select the go-fish row and click the **−** button to remove it entirely.
+select the go_fish row and click the **−** button to remove it entirely.
 Do the same under **Screen Recording**. Re-run `./install.sh`. The next
 prompt will create a fresh entry that matches the running binary, and
 it'll stick until the next rebuild.

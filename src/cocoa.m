@@ -1,4 +1,4 @@
-// cocoa.m — Cocoa side of go-fish.
+// cocoa.m — Cocoa side of go_fish.
 //
 // Responsibilities:
 //   - NSApplication lifecycle (gf_run).
@@ -24,7 +24,7 @@
 //   - Secure Event Input poller (1.5 s NSTimer) backing the SEI menu toggle.
 //     When another app holds Secure Event Input, every third-party CGEventTap
 //     is bypassed by macOS — so we paint a red-X overlay on the menu-bar icon
-//     and update the tooltip to surface that go-fish is temporarily unavailable.
+//     and update the tooltip to surface that go_fish is temporarily unavailable.
 
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
@@ -48,7 +48,7 @@ static gf_clci_t gCGWindowListCreateImage = NULL;
 // IsSecureEventInputEnabled lives in Carbon/HIToolbox. HIToolbox is loaded
 // transitively by AppKit, so dlsym from RTLD_DEFAULT finds it without us
 // linking Carbon explicitly. When secure input is on, session-level event
-// taps cannot see keyboard events — Cmd+Tab bypasses go-fish.
+// taps cannot see keyboard events — Cmd+Tab bypasses go_fish.
 typedef unsigned char (*gf_seien_t)(void);
 static gf_seien_t gIsSecureEventInputEnabled = NULL;
 
@@ -179,7 +179,7 @@ static void installEventTap(void) {
     gEventTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
                                  kCGEventTapOptionDefault, mask, tapCallback, NULL);
     if (!gEventTap) {
-        fprintf(stderr, "go-fish: failed to create event tap (Accessibility permission?)\n");
+        fprintf(stderr, "go_fish: failed to create event tap (Accessibility permission?)\n");
         return;
     }
     gEventTapSrc = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, gEventTap, 0);
@@ -445,7 +445,7 @@ gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
             return NULL;
         }
         *out_count = count;
-        fprintf(stderr, "go-fish: enumerate %lu apps -> %d windows in %.1f ms\n",
+        fprintf(stderr, "go_fish: enumerate %lu apps -> %d windows in %.1f ms\n",
                 (unsigned long)napps, count,
                 (CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
         return out;
@@ -1147,7 +1147,7 @@ void gf_cascadeAll(void) {
                     kAXPositionAttribute, &settable);
                 if (serr != kAXErrorSuccess || !settable) {
                     fprintf(stderr,
-                        "go-fish cascade: skipping \"%s\" (%s) — position not settable (err=%d settable=%d)\n",
+                        "go_fish cascade: skipping \"%s\" (%s) — position not settable (err=%d settable=%d)\n",
                         w[i].title ?: "", w[i].appName ?: "",
                         (int)serr, (int)settable);
                     skipped++;
@@ -1168,7 +1168,7 @@ void gf_cascadeAll(void) {
                 CFRelease(ptVal);
                 if (perr != kAXErrorSuccess) {
                     fprintf(stderr,
-                        "go-fish cascade: failed to move \"%s\" (%s) — AXError=%d\n",
+                        "go_fish cascade: failed to move \"%s\" (%s) — AXError=%d\n",
                         w[i].title ?: "", w[i].appName ?: "", (int)perr);
                     skipped++;
                     continue;
@@ -1192,45 +1192,77 @@ void gf_cascadeAll(void) {
                             resized++;
                         } else {
                             fprintf(stderr,
-                                "go-fish cascade: resize rejected for \"%s\" (%s) — AXError=%d\n",
+                                "go_fish cascade: resize rejected for \"%s\" (%s) — AXError=%d\n",
                                 w[i].title ?: "", w[i].appName ?: "", (int)rerr);
                         }
                     }
                 } else {
                     fprintf(stderr,
-                        "go-fish cascade: size not settable for \"%s\" (%s) — err=%d settable=%d\n",
+                        "go_fish cascade: size not settable for \"%s\" (%s) — err=%d settable=%d\n",
                         w[i].title ?: "", w[i].appName ?: "",
                         (int)szerr, (int)szSettable);
                 }
             }
             fprintf(stderr,
-                    "go-fish cascade: moved %d, resized %d, skipped %d of %d (target %.0fx%.0f)\n",
+                    "go_fish cascade: moved %d, resized %d, skipped %d of %d (target %.0fx%.0f)\n",
                     moved, resized, skipped, n, targetW, targetH);
 
             // Un-minimize, exit-fullscreen, and (on some apps) the AX
             // position write itself raise the affected window in the global
             // z-stack, breaking the assumption above that z-order survives
             // the cascade. Walk back-to-front and re-raise each window so the
-            // staircase ends with the original frontmost on top. Spaced via
-            // dispatch_after because consecutive cross-app activations race
-            // in WindowServer when fired in a tight loop.
-            for (int i = n - 1; i >= 0; i--) {
-                if (!w[i].axRef) continue;
-                AXUIElementRef axRef =
-                    (AXUIElementRef)CFRetain((CFTypeRef)w[i].axRef);
-                pid_t pid = (pid_t)w[i].pid;
-                int delaySteps = (n - 1) - i;
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                             (int64_t)delaySteps * 40 * NSEC_PER_MSEC),
-                               dispatch_get_main_queue(), ^{
+            // staircase ends with the original frontmost on top.
+            //
+            // The raises must be paced: cross-app activations race in
+            // WindowServer when fired in a tight loop, and the previous
+            // dispatch_after-with-precomputed-delays approach was broken —
+            // the move/resize loop above keeps the main queue busy past the
+            // last computed fire time, so every queued block ran back-to-back
+            // with no spacing once we returned. Chain instead: each step
+            // schedules the next, so the gap is always honored.
+            //
+            // Per-step: nominate the target window as the app's main BEFORE
+            // raising. kAXRaiseAction is unreliable on Electron/Chromium
+            // (raises whatever the app already considers main, not the
+            // element we passed) — kAXMainAttribute pins it explicitly.
+            int raiseCount = 0;
+            for (int i = 0; i < n; i++) if (w[i].axRef) raiseCount++;
+            if (raiseCount > 0) {
+                typedef struct { void *axRef; pid_t pid; } gf_raise_item_t;
+                gf_raise_item_t *items =
+                    (gf_raise_item_t *)malloc(raiseCount * sizeof(gf_raise_item_t));
+                int k = 0;
+                for (int i = n - 1; i >= 0; i--) {  // back-to-front order
+                    if (!w[i].axRef) continue;
+                    items[k].axRef = (void *)CFRetain((CFTypeRef)w[i].axRef);
+                    items[k].pid   = (pid_t)w[i].pid;
+                    k++;
+                }
+                __block int chainIdx = 0;
+                __block void (^raiseNext)(void) = nil;
+                raiseNext = ^{
+                    if (chainIdx >= raiseCount) {
+                        free(items);
+                        raiseNext = nil;  // break the __block retain cycle
+                        return;
+                    }
+                    int j = chainIdx++;
+                    AXUIElementRef axRef = (AXUIElementRef)items[j].axRef;
+                    pid_t pid = items[j].pid;
                     @autoreleasepool {
+                        AXUIElementSetAttributeValue(axRef,
+                            kAXMainAttribute, kCFBooleanTrue);
                         AXUIElementPerformAction(axRef, kAXRaiseAction);
                         NSRunningApplication *app = [NSRunningApplication
                             runningApplicationWithProcessIdentifier:pid];
                         [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
                         CFRelease(axRef);
                     }
-                });
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                                 100 * NSEC_PER_MSEC),
+                                   dispatch_get_main_queue(), raiseNext);
+                };
+                dispatch_async(dispatch_get_main_queue(), raiseNext);
             }
 
             for (int i = 0; i < n; i++) {
@@ -1591,7 +1623,7 @@ static void gf_applySEIState(BOOL active);
         alert.messageText = installed
             ? @"Couldn't remove the Start at boot LaunchAgent."
             : @"Couldn't install the Start at boot LaunchAgent.";
-        alert.informativeText = @"See the go-fish stderr log for details.";
+        alert.informativeText = @"See the go_fish stderr log for details.";
         [alert runModal];
     }
     BOOL nowOn = gf_isLaunchAgentInstalled() ? YES : NO;
@@ -1602,8 +1634,8 @@ static void gf_applySEIState(BOOL active);
             ? @"Start at boot enabled."
             : @"Start at boot disabled.";
         alert.informativeText = nowOn
-            ? @"go-fish will launch automatically on your next login. (No change to the currently-running instance.)"
-            : @"go-fish will not auto-launch on next login. The current instance keeps running until you quit it.";
+            ? @"go_fish will launch automatically on your next login. (No change to the currently-running instance.)"
+            : @"go_fish will not auto-launch on next login. The current instance keeps running until you quit it.";
         [alert runModal];
     }
 }
@@ -1645,7 +1677,7 @@ int gf_isLaunchAgentInstalled(void) {
 int gf_installLaunchAgent(void) {
     NSString *exe = gf_currentExecutablePath();
     if (exe.length == 0) {
-        fprintf(stderr, "go-fish: could not determine executable path for LaunchAgent\n");
+        fprintf(stderr, "go_fish: could not determine executable path for LaunchAgent\n");
         return -1;
     }
 
@@ -1653,8 +1685,8 @@ int gf_installLaunchAgent(void) {
     NSString *plistPath = gf_launchAgentPath();
     NSString *laDir     = [home stringByAppendingPathComponent:@"Library/LaunchAgents"];
     NSString *logDir    = [home stringByAppendingPathComponent:@"Library/Logs"];
-    NSString *stdoutLog = [logDir stringByAppendingPathComponent:@"go-fish.out.log"];
-    NSString *stderrLog = [logDir stringByAppendingPathComponent:@"go-fish.err.log"];
+    NSString *stdoutLog = [logDir stringByAppendingPathComponent:@"go_fish.out.log"];
+    NSString *stderrLog = [logDir stringByAppendingPathComponent:@"go_fish.err.log"];
 
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm createDirectoryAtPath:laDir  withIntermediateDirectories:YES attributes:nil error:nil];
@@ -1682,15 +1714,15 @@ int gf_installLaunchAgent(void) {
                      options:0
                        error:&err];
     if (!data) {
-        fprintf(stderr, "go-fish: plist serialize failed: %s\n",
+        fprintf(stderr, "go_fish: plist serialize failed: %s\n",
                 err.localizedDescription.UTF8String ?: "(unknown)");
         return -1;
     }
     if (![data writeToFile:plistPath atomically:YES]) {
-        fprintf(stderr, "go-fish: failed to write %s\n", plistPath.UTF8String);
+        fprintf(stderr, "go_fish: failed to write %s\n", plistPath.UTF8String);
         return -1;
     }
-    fprintf(stderr, "go-fish: wrote %s — takes effect on next login.\n",
+    fprintf(stderr, "go_fish: wrote %s — takes effect on next login.\n",
             plistPath.UTF8String);
     return 0;
 }
@@ -1719,12 +1751,12 @@ int gf_uninstallLaunchAgent(void) {
 
     NSError *err = nil;
     if (![fm removeItemAtPath:plistPath error:&err]) {
-        fprintf(stderr, "go-fish: failed to remove %s: %s\n",
+        fprintf(stderr, "go_fish: failed to remove %s: %s\n",
                 plistPath.UTF8String,
                 err.localizedDescription.UTF8String ?: "(unknown)");
         return -1;
     }
-    fprintf(stderr, "go-fish: removed %s\n", plistPath.UTF8String);
+    fprintf(stderr, "go_fish: removed %s\n", plistPath.UTF8String);
     return 0;
 }
 
@@ -1793,7 +1825,7 @@ static NSImage *gf_makeMenuIcon(const void *bytes, int len) {
     return icon;
 }
 
-// Build a "go-fish unavailable" composite: the silhouette in the current
+// Build a "go_fish unavailable" composite: the silhouette in the current
 // appearance's label color, with a bright red X stroked on top. Non-template
 // so the red stays red regardless of menu-bar appearance.
 static NSImage *gf_makeSEIIcon(NSImage *base) {
@@ -1826,16 +1858,16 @@ static NSImage *gf_makeSEIIcon(NSImage *base) {
 }
 
 // Swap the status-item icon + tooltip to reflect whether Secure Event Input
-// is currently blocking go-fish.
+// is currently blocking go_fish.
 static void gf_applySEIState(BOOL active) {
     atomic_store(&gSEIActive, active ? 1 : 0);
     if (!gStatusItem) return;
     if (active) {
         gStatusItem.button.image   = gIconSEI ?: gIconNormal;
-        gStatusItem.button.toolTip = @"go-fish unavailable — Secure Event Input is active";
+        gStatusItem.button.toolTip = @"go_fish unavailable — Secure Event Input is active";
     } else {
         gStatusItem.button.image   = gIconNormal;
-        gStatusItem.button.toolTip = @"go-fish";
+        gStatusItem.button.toolTip = @"go_fish";
     }
 }
 
@@ -1879,7 +1911,7 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
     gStatusItem = [[NSStatusBar systemStatusBar]
         statusItemWithLength:NSVariableStatusItemLength];
     gStatusItem.button.image   = icon;
-    gStatusItem.button.toolTip = @"go-fish";
+    gStatusItem.button.toolTip = @"go_fish";
 
     // Restore the user's preference (default: enabled).
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];

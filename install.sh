@@ -1,21 +1,21 @@
 #!/usr/bin/env zsh
-# install.sh — install go-fish as a user binary in ~/Applications.
+# install.sh — install go_fish as a user binary in ~/Applications.
 #
 # Usage:
-#   ./install.sh              install or refresh using ./bin/go-fish
+#   ./install.sh              install or refresh using ./bin/go_fish
 #   ./install.sh --build      compile from ./src first, then install
 #                             (requires Go + Xcode Command Line Tools)
 #   ./install.sh uninstall    full teardown: stop process, remove
 #                             LaunchAgent (if present), remove binary
 #
-# Install does NOT register a LaunchAgent — go-fish runs as a normal
-# foreground binary you launch yourself (`open ~/Applications/go-fish`
+# Install does NOT register a LaunchAgent — go_fish runs as a normal
+# foreground binary you launch yourself (`open ~/Applications/go_fish`
 # or double-click). Auto-start at login is opt-in via the "Start at
 # boot" menu item, which writes ~/Library/LaunchAgents/com.local.gofish.plist
 # on demand.
 #
 # Build flow: `go build` runs inside ./src and writes the binary to
-# ./bin/go-fish. Install copies that file to ~/Applications/go-fish.
+# ./bin/go_fish. Install copies that file to ~/Applications/go_fish.
 # No sudo required.
 
 set -euo pipefail
@@ -25,22 +25,22 @@ LABEL="com.local.gofish"
 SCRIPT_DIR="${0:A:h}"
 SRC_DIR="${SCRIPT_DIR}/src"
 LOCAL_BIN_DIR="${SCRIPT_DIR}/bin"
-LOCAL_BIN="${LOCAL_BIN_DIR}/go-fish"
+LOCAL_BIN="${LOCAL_BIN_DIR}/go_fish"
 
 # User-writable, conventional spot for per-user apps/binaries.
 INSTALL_DIR="${HOME}/Applications"
-INSTALL_PATH="${INSTALL_DIR}/go-fish"
+INSTALL_PATH="${INSTALL_DIR}/go_fish"
 
 LAUNCHAGENT_DIR="${HOME}/Library/LaunchAgents"
 PLIST_PATH="${LAUNCHAGENT_DIR}/${LABEL}.plist"
 LOG_DIR="${HOME}/Library/Logs"
-STDOUT_LOG="${LOG_DIR}/go-fish.out.log"
-STDERR_LOG="${LOG_DIR}/go-fish.err.log"
-SUPPORT_DIR="${HOME}/Library/Application Support/go-fish"
+STDOUT_LOG="${LOG_DIR}/go_fish.out.log"
+STDERR_LOG="${LOG_DIR}/go_fish.err.log"
+SUPPORT_DIR="${HOME}/Library/Application Support/go_fish"
 
 # Default cache override avoids the root-owned ~/Library/Caches/go-build
 # trap when this repo has been built under sudo at some point.
-: ${GOCACHE:=/tmp/go-fish-cache}
+: ${GOCACHE:=/tmp/go_fish-cache}
 export GOCACHE
 
 # --- argument parsing -------------------------------------------------
@@ -70,7 +70,7 @@ stop_running() {
     fi
     launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
     pkill -f "${INSTALL_PATH}" 2>/dev/null || true
-    pkill -x "go-fish" 2>/dev/null || true
+    pkill -x "go_fish" 2>/dev/null || true
 }
 
 case "${action}" in
@@ -108,7 +108,7 @@ install)
 
     cat <<EOF
 
-go-fish installed.
+go_fish installed.
   binary:  ${INSTALL_PATH}
   logs:    ${STDERR_LOG}
            ${STDOUT_LOG}
@@ -120,20 +120,20 @@ To start it now:
 The first launch will prompt for Accessibility + Screen Recording
 permissions. Grant both, then re-launch.
 
-Toggle "Start at boot" from the menu-bar icon to have go-fish come
+Toggle "Start at boot" from the menu-bar icon to have go_fish come
 back automatically at login.
 
 System Settings > Keyboard > Keyboard Shortcuts:
   - Disable Mission Control's Cmd+Tab
   - Disable "Move focus to next window in active app" (Cmd+\`)
-  so go-fish gets the keystrokes first.
+  so go_fish gets the keystrokes first.
 
 Uninstall: ${0:t} uninstall
 EOF
     ;;
 
 uninstall)
-    echo "Stopping any running go-fish..."
+    echo "Stopping any running go_fish..."
     stop_running
 
     if [[ -e "${PLIST_PATH}" ]]; then
@@ -149,9 +149,9 @@ uninstall)
     # Best-effort: also clean up the legacy /usr/local/bin install path
     # from earlier versions, so a fresh install can't be shadowed by a
     # stale binary on PATH.
-    if [[ -e /usr/local/bin/go-fish ]]; then
-        echo "Removing legacy /usr/local/bin/go-fish (sudo required)"
-        sudo rm -f /usr/local/bin/go-fish || true
+    if [[ -e /usr/local/bin/go_fish ]]; then
+        echo "Removing legacy /usr/local/bin/go_fish (sudo required)"
+        sudo rm -f /usr/local/bin/go_fish || true
     fi
 
     if [[ -d "${SUPPORT_DIR}" ]]; then
@@ -161,7 +161,7 @@ uninstall)
 
     # Logs: prompt, default no.
     if [[ -e "${STDOUT_LOG}" || -e "${STDERR_LOG}" ]]; then
-        printf "Also remove logs at %s{out,err}.log? [y/N] " "${LOG_DIR}/go-fish."
+        printf "Also remove logs at %s{out,err}.log? [y/N] " "${LOG_DIR}/go_fish."
         read -r ans
         case "${ans}" in
             y|Y|yes|YES) rm -f "${STDOUT_LOG}" "${STDERR_LOG}" ;;
@@ -169,7 +169,7 @@ uninstall)
         esac
     fi
 
-    echo "go-fish uninstalled."
+    echo "go_fish uninstalled."
     echo "(Accessibility / Screen Recording grants in System Settings remain"
     echo " until you remove them manually.)"
     ;;

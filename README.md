@@ -1,4 +1,4 @@
-# go-fish
+# go_fish
 
 A fast, lightweight macOS window switcher with a thumbnail grid. Replaces
 Cmd+Tab — which switches between *apps* — with a per-window switcher that
@@ -29,7 +29,7 @@ the same app.
   permission can never turn into a restart loop)
 - **Secure Event Input awareness** — when an app holds Secure Event
   Input (Terminal during `sudo`, password managers, some VPN clients),
-  Cmd+Tab is invisible to *any* third-party event tap. go-fish polls
+  Cmd+Tab is invisible to *any* third-party event tap. go_fish polls
   for this state and overlays a red X on the menu-bar icon so you know
   the switcher is temporarily unavailable and why.
 - **Thumbnail caching** so the grid opens instantly for recently-focused
@@ -44,12 +44,12 @@ the same app.
 ## Quickstart
 
 ```sh
-# Build + install in one shot (compiles ./src → ./bin/go-fish, then
-# copies to ~/Applications/go-fish). No sudo, no LaunchAgent by default.
+# Build + install in one shot (compiles ./src → ./bin/go_fish, then
+# copies to ~/Applications/go_fish). No sudo, no LaunchAgent by default.
 # Requires Go 1.22+ and Xcode Command Line Tools.
 ./install.sh --build
 
-# Or, if you already have a prebuilt binary at ./bin/go-fish:
+# Or, if you already have a prebuilt binary at ./bin/go_fish:
 ./install.sh
 
 # Total uninstall (kills process, removes LaunchAgent if installed,
@@ -57,17 +57,17 @@ the same app.
 ./install.sh uninstall
 ```
 
-After installing, launch go-fish (it does not start automatically):
+After installing, launch go_fish (it does not start automatically):
 
 ```sh
-open ~/Applications/go-fish
+open ~/Applications/go_fish
 ```
 
 The first launch will prompt for two permissions in **System Settings →
 Privacy & Security**:
 
-1. **Accessibility** → enable `~/Applications/go-fish`
-2. **Screen Recording** → enable `~/Applications/go-fish`
+1. **Accessibility** → enable `~/Applications/go_fish`
+2. **Screen Recording** → enable `~/Applications/go_fish`
 
 Then re-launch. Also under **System Settings → Keyboard → Keyboard
 Shortcuts**:
@@ -77,7 +77,7 @@ Shortcuts**:
    (Cmd+\`)
 
 Press Cmd+Tab. The grid pops up. Cycle with Tab, release Cmd to commit,
-Esc to cancel. If you want go-fish back automatically next login, click
+Esc to cancel. If you want go_fish back automatically next login, click
 the menu-bar hook and check **Start at boot**.
 
 ## Repo layout
@@ -86,7 +86,7 @@ the menu-bar hook and check **Start at boot**.
 go_fish/
 ├── README.md
 ├── install.sh             # build / install / uninstall (no LaunchAgent by default)
-├── bin/go-fish            # prebuilt binary (also produced by --build)
+├── bin/go_fish            # prebuilt binary (also produced by --build)
 ├── docs/{USAGE,BUILDING}.md
 └── src/                   # Go + Objective-C source + embedded hook.png
 ```
@@ -131,7 +131,7 @@ CoreGraphics:
   `~/Library/LaunchAgents/com.local.gofish.plist` pointing at the
   running binary's `realpath`. The plist sets `ThrottleInterval=30`,
   and the binary itself tracks permission-failure attempts in
-  `~/Library/Application Support/go-fish/attempts.txt`, giving up
+  `~/Library/Application Support/go_fish/attempts.txt`, giving up
   cleanly (`exit 0`) after the 3rd failed preflight so launchd's
   `SuccessfulExit=false` doesn't loop.
 

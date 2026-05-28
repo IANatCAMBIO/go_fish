@@ -1,4 +1,4 @@
-# Building go-fish
+# Building go_fish
 
 ## Requirements
 
@@ -12,16 +12,16 @@
 Source code lives under `src/`. From the repo root:
 
 ```sh
-( cd src && go build -o ../bin/go-fish )
+( cd src && go build -o ../bin/go_fish )
 ```
 
 …which is exactly what `./install.sh --build` does for you.
 
-This produces a single `bin/go-fish` binary (~2–3 MB). To strip symbols
+This produces a single `bin/go_fish` binary (~2–3 MB). To strip symbols
 and shrink:
 
 ```sh
-( cd src && go build -ldflags="-s -w" -o ../bin/go-fish )
+( cd src && go build -ldflags="-s -w" -o ../bin/go_fish )
 ```
 
 ### What cgo links against
@@ -53,7 +53,7 @@ sudo chown -R "$USER":staff ~/Library/Caches/go-build
 Or override per-build:
 
 ```sh
-( cd src && GOCACHE=/tmp/gocache go build -o ../bin/go-fish )
+( cd src && GOCACHE=/tmp/gocache go build -o ../bin/go_fish )
 ```
 
 ### `'CGWindowListCreateImage' is unavailable: obsoleted in macOS 15.0`
@@ -75,9 +75,9 @@ sudo xcode-select --install
 For a universal binary covering both Apple Silicon and Intel:
 
 ```sh
-( cd src && GOARCH=arm64 go build -o ../bin/go-fish-arm64 )
-( cd src && GOARCH=amd64 go build -o ../bin/go-fish-amd64 )
-lipo -create -output bin/go-fish bin/go-fish-arm64 bin/go-fish-amd64
+( cd src && GOARCH=arm64 go build -o ../bin/go_fish-arm64 )
+( cd src && GOARCH=amd64 go build -o ../bin/go_fish-amd64 )
+lipo -create -output bin/go_fish bin/go_fish-arm64 bin/go_fish-amd64
 ```
 
 ## Code signing
@@ -105,14 +105,14 @@ For a free local fix that survives rebuilds, create a self-signed
 code-signing cert in **Keychain Access → Certificate Assistant →
 Create a Certificate…**:
 
-- **Name:** anything memorable, e.g. `go-fish-signer`
+- **Name:** anything memorable, e.g. `go_fish-signer`
 - **Identity Type:** Self Signed Root
 - **Certificate Type:** Code Signing
 
 After creating it, sign manually before running the installer:
 
 ```sh
-codesign --force --sign go-fish-signer bin/go-fish
+codesign --force --sign go_fish-signer bin/go_fish
 ./install.sh                              # without --build, so the signed binary is what gets installed
 ```
 
@@ -126,11 +126,11 @@ instead — same effect as a self-signed cert, plus the binary will work
 on machines other than yours:
 
 ```sh
-codesign --sign "Developer ID Application: …" --options runtime --force bin/go-fish
+codesign --sign "Developer ID Application: …" --options runtime --force bin/go_fish
 ```
 
 After switching signing identities (ad-hoc → self-signed, self-signed →
-Developer ID, etc.), you'll need to remove the old go-fish entry from
+Developer ID, etc.), you'll need to remove the old go_fish entry from
 System Settings → Privacy & Security → Accessibility (and Screen
 Recording) once.
 
@@ -139,11 +139,11 @@ Recording) once.
 ```
 go_fish/
 ├── README.md
-├── install.sh             # build / install (~/Applications/go-fish) / uninstall;
+├── install.sh             # build / install (~/Applications/go_fish) / uninstall;
 │                          #   no LaunchAgent by default — that's opt-in via the
-│                          #   "Start at boot" menu item once go-fish is running
+│                          #   "Start at boot" menu item once go_fish is running
 ├── bin/
-│   └── go-fish            # prebuilt binary; --build writes here
+│   └── go_fish            # prebuilt binary; --build writes here
 ├── docs/
 │   ├── BUILDING.md
 │   └── USAGE.md
@@ -174,7 +174,7 @@ editing either side:
   buffer in stable app order so window ordering / `fallbackZ` are
   identical to the pre-parallel implementation. Per-app messaging
   timeout is 100 ms; unresponsive apps surface as a single
-  `unresponsive=1` entry with `axRef=NULL`. Emits a `go-fish: enumerate
+  `unresponsive=1` entry with `axRef=NULL`. Emits a `go_fish: enumerate
   N apps -> M windows in X.X ms` line to stderr on every call.
 - `gf_activateWindow(axRef, pid, minimized)` — un-minimize + raise +
   activate. Accepts `axRef=NULL` for unresponsive placeholders (falls
