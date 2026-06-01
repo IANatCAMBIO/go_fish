@@ -4,7 +4,7 @@
 # Usage:
 #   ./install.sh              install or refresh using ./bin/go_fish
 #   ./install.sh --build      compile from ./src first, then install
-#                             (requires Go + Xcode Command Line Tools)
+#                             (requires Xcode Command Line Tools)
 #   ./install.sh uninstall    full teardown: stop process, remove the
 #                             Login Items entry + any legacy LaunchAgent,
 #                             remove binary
@@ -15,9 +15,9 @@
 # boot" menu item, which adds the binary to the per-user Login Items
 # list (System Settings > General > Login Items) on demand.
 #
-# Build flow: `go build` runs inside ./src and writes the binary to
-# ./bin/go_fish. Install copies that file to ~/Applications/go_fish.
-# No sudo required.
+# Build flow: `make` runs inside ./src (clang, pure Objective-C) and writes
+# the binary to ./bin/go_fish. Install copies that file to
+# ~/Applications/go_fish. No sudo required.
 
 set -euo pipefail
 
@@ -38,11 +38,6 @@ LOG_DIR="${HOME}/Library/Logs"
 STDOUT_LOG="${LOG_DIR}/go_fish.out.log"
 STDERR_LOG="${LOG_DIR}/go_fish.err.log"
 SUPPORT_DIR="${HOME}/Library/Application Support/go_fish"
-
-# Default cache override avoids the root-owned ~/Library/Caches/go-build
-# trap when this repo has been built under sudo at some point.
-: ${GOCACHE:=/tmp/go_fish-cache}
-export GOCACHE
 
 # --- argument parsing -------------------------------------------------
 do_build=false
@@ -79,7 +74,7 @@ install)
     if ${do_build}; then
         echo "Building ${LOCAL_BIN} from ${SRC_DIR}..."
         mkdir -p "${LOCAL_BIN_DIR}"
-        ( cd "${SRC_DIR}" && go build -o "${LOCAL_BIN}" )
+        ( cd "${SRC_DIR}" && make )
     fi
     if [[ ! -x "${LOCAL_BIN}" ]]; then
         echo "ERROR: ${LOCAL_BIN} not found or not executable." >&2

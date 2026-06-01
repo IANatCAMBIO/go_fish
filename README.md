@@ -47,7 +47,7 @@ the same app.
 ```sh
 # Build + install in one shot (compiles ./src → ./bin/go_fish, then
 # copies to ~/Applications/go_fish). No sudo, no auto-launch by default.
-# Requires Go 1.22+ and Xcode Command Line Tools.
+# Requires Xcode Command Line Tools (clang + make).
 ./install.sh --build
 
 # Or, if you already have a prebuilt binary at ./bin/go_fish:
@@ -88,10 +88,10 @@ the menu-bar hook and check **Start at boot**.
 ```
 go_fish/
 ├── README.md
-├── install.sh             # build / install / uninstall (no LaunchAgent by default)
+├── install.sh             # build / install / uninstall (no auto-launch by default)
 ├── bin/go_fish            # prebuilt binary (also produced by --build)
 ├── docs/{USAGE,BUILDING}.md
-└── src/                   # Go + Objective-C source + embedded hook.png
+└── src/                   # Objective-C source + Makefile + embedded hook.png
 ```
 
 ## Documentation
@@ -104,8 +104,7 @@ go_fish/
 
 ## How it works
 
-Written in Go with a CGO bridge to AppKit, Accessibility, and
-CoreGraphics:
+Written in Objective-C against AppKit, Accessibility, and CoreGraphics:
 
 - **Hotkey capture** — a global `CGEventTap` intercepts Cmd+Tab and
   Cmd+\` before they reach the focused app. macOS Secure Event Input

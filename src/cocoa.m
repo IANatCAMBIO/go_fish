@@ -65,12 +65,9 @@ static void gf_loadSymbols(void) {
 // Private API. Maps an AX window element to its CGWindowID. Stable for ~15 years.
 extern AXError _AXUIElementGetWindow(AXUIElementRef element, CGWindowID *out);
 
-// Callbacks from Go.
-extern int  gfOnHotkey(int shift, int scope);
-extern int  gfOnCommit(void);
-extern int  gfOnCancel(void);
-extern void gfSetSelection(int idx);
-extern int  gfOnClose(int idx);
+// Switcher event entry points (defined in switcher.m). The event tap and the
+// panel mouse handlers call these to drive selection / commit / cancel / close.
+#include "switcher.h"
 
 // =========================================================================
 // State (main thread only, unless noted).
@@ -748,8 +745,8 @@ static void gf_initDrawAttrs(void) {
     NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
     NSInteger idx = [self indexAtPoint:p];
     if (idx >= 0 && idx != self.selected) {
-        // Drive selection through Go so state stays consistent;
-        // it'll call back into gf_updateSelection to redraw.
+        // Drive selection through the switcher so state stays consistent;
+        // it calls back into gf_updateSelection to redraw.
         gfSetSelection((int)idx);
     }
 }
