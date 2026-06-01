@@ -4,19 +4,20 @@
 # Usage:
 #   ./install.sh              install or refresh using ./bin/go_fish
 #   ./install.sh --build      compile from ./src first, then install
-#                             (requires Go + Xcode Command Line Tools)
-#   ./install.sh uninstall    full teardown: stop process, remove
-#                             LaunchAgent (if present), remove binary
+#                             (requires Xcode Command Line Tools)
+#   ./install.sh uninstall    full teardown: stop process, remove the
+#                             Login Items entry + any legacy LaunchAgent,
+#                             remove binary
 #
-# Install does NOT register a LaunchAgent — go_fish runs as a normal
+# Install does NOT register go_fish for startup — it runs as a normal
 # foreground binary you launch yourself (`open ~/Applications/go_fish`
 # or double-click). Auto-start at login is opt-in via the "Start at
-# boot" menu item, which writes ~/Library/LaunchAgents/com.local.gofish.plist
-# on demand.
+# boot" menu item, which adds the binary to the per-user Login Items
+# list (System Settings > General > Login Items) on demand.
 #
-# Build flow: `go build` runs inside ./src and writes the binary to
-# ./bin/go_fish. Install copies that file to ~/Applications/go_fish.
-# No sudo required.
+# Build flow: `make` runs inside ./src (clang, pure Objective-C) and writes
+# the binary to ./bin/go_fish. Install copies that file to
+# ~/Applications/go_fish. No sudo required.
 
 set -euo pipefail
 
@@ -37,11 +38,6 @@ LOG_DIR="${HOME}/Library/Logs"
 STDOUT_LOG="${LOG_DIR}/go_fish.out.log"
 STDERR_LOG="${LOG_DIR}/go_fish.err.log"
 SUPPORT_DIR="${HOME}/Library/Application Support/go_fish"
-
-# Default cache override avoids the root-owned ~/Library/Caches/go-build
-# trap when this repo has been built under sudo at some point.
-: ${GOCACHE:=/tmp/go_fish-cache}
-export GOCACHE
 
 # --- argument parsing -------------------------------------------------
 do_build=false
@@ -78,7 +74,7 @@ install)
     if ${do_build}; then
         echo "Building ${LOCAL_BIN} from ${SRC_DIR}..."
         mkdir -p "${LOCAL_BIN_DIR}"
-        ( cd "${SRC_DIR}" && go build -o "${LOCAL_BIN}" )
+        ( cd "${SRC_DIR}" && make )
     fi
     if [[ ! -x "${LOCAL_BIN}" ]]; then
         echo "ERROR: ${LOCAL_BIN} not found or not executable." >&2
@@ -91,8 +87,8 @@ install)
     # copy it to ~/Applications. Note: ad-hoc re-signing on every build
     # changes the code identity, which makes macOS revoke previously-granted
     # Accessibility / Screen Recording. You'll need to re-approve in System
-    # Settings after each build. The new "Start at boot" backoff (3-attempt
-    # cap inside the binary) keeps that from turning into a launchd loop.
+    # Settings after each build. The "Start at boot" backoff (3-attempt cap
+    # inside the binary) keeps a missing grant from re-prompting every login.
     echo "Ad-hoc signing ${LOCAL_BIN}..."
     codesign --force --sign - "${LOCAL_BIN}"
 
@@ -136,10 +132,18 @@ uninstall)
     echo "Stopping any running go_fish..."
     stop_running
 
+    # Legacy: older versions registered a LaunchAgent. Remove it if present.
     if [[ -e "${PLIST_PATH}" ]]; then
         echo "Removing ${PLIST_PATH}"
         rm -f "${PLIST_PATH}"
     fi
+
+    # Remove any Login Items entry the "Start at boot" toggle added. Best-effort
+    # via System Events (may trigger a one-time Automation prompt for the
+    # terminal; harmless to deny — you can also remove it by hand in
+    # System Settings > General > Login Items).
+    echo "Removing go_fish from Login Items (if present)..."
+    osascript -e 'tell application "System Events" to delete (every login item whose name is "go_fish")' 2>/dev/null || true
 
     if [[ -e "${INSTALL_PATH}" ]]; then
         echo "Removing ${INSTALL_PATH}"

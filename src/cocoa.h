@@ -63,21 +63,21 @@ void gf_closeWindow(void *axRef);
 void gf_minimizeAll(void);
 void gf_cascadeAll(void);
 
-// LaunchAgent management for the "Start at boot" menu item.
-//   * gf_isLaunchAgentInstalled — does the per-user plist exist AND point
-//                                 at the currently-running binary. A plist
-//                                 that targets a different path (e.g. a
-//                                 stale dev-build location) reports as not
-//                                 installed, so the menu reflects whether
-//                                 *this* binary will start at boot.
-//   * gf_installLaunchAgent     — write the plist pointing at the running
-//                                 binary's path. Effective on next login;
-//                                 we deliberately do not launchctl-load it
-//                                 now to avoid spawning a second instance.
-//   * gf_uninstallLaunchAgent   — remove the plist. If we're currently
-//                                 running under launchd, also bootout so
-//                                 we don't get re-launched after exit.
+// Login-item management for the "Start at boot" menu item. Adds / removes the
+// running binary from the per-user Login Items list (System Settings >
+// General > Login Items) — the same list the "+" button populates. Backed by
+// the LSSharedFileList session list, the only programmatic path that works for
+// a bare binary (SMAppService requires a real .app bundle).
+//   * gf_isLoginItemInstalled — is the currently-running binary in the list.
+//                               Matches by resolved path, so a stale entry for
+//                               a different binary location (e.g. an old
+//                               dev-build path) reports as not installed; the
+//                               menu reflects whether *this* binary will start
+//                               at boot.
+//   * gf_installLoginItem     — add the running binary. Effective on next
+//                               login; we deliberately do not relaunch now.
+//   * gf_uninstallLoginItem   — remove the running binary's entry.
 // Return 0 on success, non-zero on failure.
-int  gf_isLaunchAgentInstalled(void);
-int  gf_installLaunchAgent(void);
-int  gf_uninstallLaunchAgent(void);
+int  gf_isLoginItemInstalled(void);
+int  gf_installLoginItem(void);
+int  gf_uninstallLoginItem(void);

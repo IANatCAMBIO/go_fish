@@ -14,7 +14,7 @@ open ~/Applications/go_fish
 ```
 
 (Or double-click `go_fish` in Finder.) The installer does **not**
-register a LaunchAgent — go_fish runs as a normal foreground binary you
+register go_fish for startup — it runs as a normal foreground binary you
 start yourself. Auto-launch on login is opt-in via the **Start at boot**
 menu item once go_fish is up.
 
@@ -31,9 +31,10 @@ If you launch before granting permissions, the binary will exit and
 write the failure to its attempt counter at
 `~/Library/Application Support/go_fish/attempts.txt`. The next two
 launches add a 1 s and 2 s sleep before retrying; after a 3rd failed
-preflight, the binary exits *cleanly* (`exit 0`) — which matters under
-the LaunchAgent path because launchd's `SuccessfulExit=false` keep-alive
-won't restart it. A successful start resets the counter.
+preflight, the binary exits *cleanly* (`exit 0`) and resets the counter —
+so when launched as a Login Item, a missing permission re-prompts at most
+three times across logins instead of on every single one. A successful
+start also resets the counter.
 
 After granting both, re-launch. You should see:
 
@@ -57,13 +58,10 @@ go_fish is running. Click it to drop down a menu:
   AX position writes (fixed-UI Electron tools, full-screen apps that
   don't expose `AXFullScreen`, etc.) are skipped silently; the log file
   (`~/Library/Logs/go_fish.err.log`) records which.
-- **Start at boot** (toggle) — writes / removes
-  `~/Library/LaunchAgents/com.local.gofish.plist` pointing at the
-  running binary's resolved path. Effective on next login; the currently
-  running instance is not affected. Turning it off while running under
-  launchd schedules a `launchctl bootout` so the agent doesn't reload
-  the binary next time. See **Running in the background** below for the
-  contract details.
+- **Start at boot** (toggle) — adds / removes the running binary in your
+  per-user **Login Items** (System Settings → General → Login Items).
+  Effective on next login; the currently running instance is not
+  affected. See **Auto-launch on login** below for the contract details.
 - **Secure Event Input detection** (toggle) — when checked (default),
   go_fish polls `IsSecureEventInputEnabled()` every 1.5 s. While Secure
   Event Input is held by another app, the menu-bar icon gets a red X
@@ -207,73 +205,52 @@ hotkey.
 
 ```sh
 ./install.sh              # install the prebuilt ./bin/go_fish into ~/Applications/
-./install.sh --build      # compile ./src → ./bin/go_fish first (needs Go + Xcode CLT)
-./install.sh uninstall    # full teardown: stops process, removes LaunchAgent
-                          # (if any), removes the binary, optionally clears logs
+./install.sh --build      # compile ./src → ./bin/go_fish first (needs Xcode CLT)
+./install.sh uninstall    # full teardown: stops process, removes the Login Items
+                          # entry + any legacy LaunchAgent, removes the binary,
+                          # optionally clears logs
 ```
 
-The installer **does not** register a LaunchAgent. It just builds
-(optional), ad-hoc signs, and copies the binary to
+The installer **does not** register go_fish for startup. It just builds
+(optional, via `make`), ad-hoc signs, and copies the binary to
 `~/Applications/go_fish`. Launch it manually via `open
 ~/Applications/go_fish` or by double-clicking in Finder.
 
-`install.sh` exports `GOCACHE=/tmp/go_fish-cache` before building, which
-sidesteps the root-owned `~/Library/Caches/go-build` trap that can
-appear on machines where `go build` was once run under `sudo`.
-
 ### Auto-launch on login: Start at boot
 
-Open the menu-bar hook and check **Start at boot**. That writes
-`~/Library/LaunchAgents/com.local.gofish.plist` pointing at the running
-binary's resolved path. Contract:
+Open the menu-bar hook and check **Start at boot**. That adds the running
+binary's resolved path to your per-user **Login Items** (the list under
+**System Settings → General → Login Items**, the same one the "+" button
+populates), via the `LSSharedFileList` session list. Contract:
 
-- **No effect on the currently running instance.** We deliberately do
-  *not* `launchctl load` immediately — that would spawn a second
-  go_fish under launchd's management, fighting the first for the event
-  tap. The plist takes effect on your next login.
-- **Unchecking** removes the plist. If go_fish is currently running
-  under launchd (`getppid() == 1`), it schedules a `launchctl bootout`
-  so the agent is detached and won't relaunch the binary on exit.
-- **Crash-loop guard.** The plist sets `ThrottleInterval=30` (launchd's
-  minimum gap between launches). The binary itself adds an attempt
-  counter (`~/Library/Application Support/go_fish/attempts.txt`) that
-  sleeps 0 s, 1 s, then 2 s before consecutive permission preflights,
-  and after the 3rd failure exits with `0` so `SuccessfulExit=false`
-  doesn't restart it. A successful start resets the counter. Net
-  effect: a missing permission can never turn into a runaway restart
-  loop.
+- **No effect on the currently running instance.** The entry takes effect
+  on your next login; the current process keeps running.
+- **Matched by resolved path.** The toggle reflects whether *this* binary
+  is registered. A stale entry pointing at a different location (e.g. an
+  old dev-build path) reads as not installed, so the checkmark tracks the
+  binary you're actually running.
+- **Unchecking** removes that entry from the list.
+- **Launches once at login.** Unlike the old LaunchAgent, a Login Item is
+  not auto-restarted if it crashes. A permission-prompt guard still
+  applies: the binary tracks attempts in
+  `~/Library/Application Support/go_fish/attempts.txt`, sleeping 0 s, 1 s,
+  then 2 s before consecutive permission preflights, and after the 3rd
+  failure exits with `0` and resets the counter — so a missing permission
+  can't re-prompt on every login.
 
-The plist that gets written looks like this — useful to know if you're
-debugging or want to hand-edit fields:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.local.gofish</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/Users/YOUR_USERNAME/Applications/go_fish</string>
-    </array>
-    <key>RunAtLoad</key>      <true/>
-    <key>KeepAlive</key>      <dict><key>SuccessfulExit</key><false/></dict>
-    <key>ThrottleInterval</key><integer>30</integer>
-    <key>ProcessType</key>    <string>Interactive</string>
-    <key>StandardOutPath</key><string>/Users/YOUR_USERNAME/Library/Logs/go_fish.out.log</string>
-    <key>StandardErrorPath</key><string>/Users/YOUR_USERNAME/Library/Logs/go_fish.err.log</string>
-</dict>
-</plist>
-```
-
-Manual control of the same plist:
+You can inspect or edit the same list from the command line:
 
 ```sh
-launchctl load -w ~/Library/LaunchAgents/com.local.gofish.plist
-launchctl unload   ~/Library/LaunchAgents/com.local.gofish.plist
+# list current login items
+osascript -e 'tell application "System Events" to get the name of every login item'
+
+# remove go_fish's entry by hand
+osascript -e 'tell application "System Events" to delete (every login item whose name is "go_fish")'
 ```
+
+> Earlier versions registered a LaunchAgent at
+> `~/Library/LaunchAgents/com.local.gofish.plist` instead. `./install.sh
+> uninstall` removes that legacy plist if it's still present.
 
 ## Resource footprint
 
@@ -306,9 +283,10 @@ Disable it (see "Disable the system Cmd+Tab" above).
   & Security → Accessibility). The toggle must be **on** for `go_fish`.
 - If you re-signed or rebuilt the binary, macOS may consider it a new app
   and silently revoke the permission until you re-grant it.
-- Check `~/Library/Logs/go_fish.err.log` (where the binary's stderr
-  goes when running under a LaunchAgent, and also when started via
-  `open` from Finder).
+- Check the binary's stderr. Launched from a terminal it prints there;
+  launched as a Login Item or via `open` it goes to the system log
+  (`log stream --predicate 'process == "go_fish"'`), or redirect it
+  yourself, e.g. `nohup ~/Applications/go_fish >~/Library/Logs/go_fish.err.log 2>&1 &`.
 
 ### Cmd+Tab silently does nothing (system switcher also doesn't appear)
 

@@ -17,10 +17,10 @@
 //     Cascade All, Start at boot, Secure Event Input detection, Quit.
 //   - MRU tracker fed by NSWorkspaceDidActivateApplicationNotification plus
 //     per-app AXObserver focused-window-changed callbacks.
-//   - LaunchAgent management for the "Start at boot" toggle: writes /
-//     removes ~/Library/LaunchAgents/com.local.gofish.plist pointing at the
-//     running binary's resolved path. Effective on next login; we don't
-//     launchctl-load now to avoid duplicate instances under launchd.
+//   - Login-item management for the "Start at boot" toggle: adds / removes
+//     the running binary from the per-user Login Items list (System Settings
+//     > General > Login Items) via the LSSharedFileList session list.
+//     Effective on next login; we don't relaunch the current instance.
 //   - Secure Event Input poller (1.5 s NSTimer) backing the SEI menu toggle.
 //     When another app holds Secure Event Input, every third-party CGEventTap
 //     is bypassed by macOS — so we paint a red-X overlay on the menu-bar icon
@@ -29,6 +29,7 @@
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <CoreServices/CoreServices.h>  // LSSharedFileList (Login Items)
 #include "cocoa.h"
 #include <dlfcn.h>
 #include <limits.h>
@@ -64,12 +65,9 @@ static void gf_loadSymbols(void) {
 // Private API. Maps an AX window element to its CGWindowID. Stable for ~15 years.
 extern AXError _AXUIElementGetWindow(AXUIElementRef element, CGWindowID *out);
 
-// Callbacks from Go.
-extern int  gfOnHotkey(int shift, int scope);
-extern int  gfOnCommit(void);
-extern int  gfOnCancel(void);
-extern void gfSetSelection(int idx);
-extern int  gfOnClose(int idx);
+// Switcher event entry points (defined in switcher.m). The event tap and the
+// panel mouse handlers call these to drive selection / commit / cancel / close.
+#include "switcher.h"
 
 // =========================================================================
 // State (main thread only, unless noted).
@@ -747,8 +745,8 @@ static void gf_initDrawAttrs(void) {
     NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
     NSInteger idx = [self indexAtPoint:p];
     if (idx >= 0 && idx != self.selected) {
-        // Drive selection through Go so state stays consistent;
-        // it'll call back into gf_updateSelection to redraw.
+        // Drive selection through the switcher so state stays consistent;
+        // it calls back into gf_updateSelection to redraw.
         gfSetSelection((int)idx);
     }
 }
@@ -1616,17 +1614,17 @@ static void gf_applySEIState(BOOL active);
     }
 }
 - (void)toggleStartAtBoot:(id)sender {
-    BOOL installed = gf_isLaunchAgentInstalled() ? YES : NO;
-    int rc = installed ? gf_uninstallLaunchAgent() : gf_installLaunchAgent();
+    BOOL installed = gf_isLoginItemInstalled() ? YES : NO;
+    int rc = installed ? gf_uninstallLoginItem() : gf_installLoginItem();
     if (rc != 0) {
         NSAlert *alert = [[NSAlert alloc] init];
         alert.messageText = installed
-            ? @"Couldn't remove the Start at boot LaunchAgent."
-            : @"Couldn't install the Start at boot LaunchAgent.";
+            ? @"Couldn't remove go_fish from Login Items."
+            : @"Couldn't add go_fish to Login Items.";
         alert.informativeText = @"See the go_fish stderr log for details.";
         [alert runModal];
     }
-    BOOL nowOn = gf_isLaunchAgentInstalled() ? YES : NO;
+    BOOL nowOn = gf_isLoginItemInstalled() ? YES : NO;
     self.bootItem.state = nowOn ? NSControlStateValueOn : NSControlStateValueOff;
     if (rc == 0 && nowOn != installed) {
         NSAlert *alert = [[NSAlert alloc] init];
@@ -1645,18 +1643,18 @@ static void gf_applySEIState(BOOL active);
 @end
 
 // =========================================================================
-// LaunchAgent management ("Start at boot")
+// Login-item management ("Start at boot")
 // =========================================================================
-
-static NSString *const kLaunchAgentLabel = @"com.local.gofish";
-
-static NSString *gf_launchAgentPath(void) {
-    return [NSString stringWithFormat:@"%@/Library/LaunchAgents/%@.plist",
-            NSHomeDirectory(), kLaunchAgentLabel];
-}
+//
+// We add/remove the running binary from the per-user Login Items list — the
+// same list System Settings > General > Login Items shows and the "+" button
+// populates. This is the LSSharedFileList session list: deprecated since
+// 10.11 but still the only programmatic way to register a *bare binary*
+// (SMAppService requires a real .app bundle). The build passes
+// -Wno-deprecated-declarations so these calls compile clean.
 
 // Resolve the running binary's absolute path. _NSGetExecutablePath may
-// return a path with .. or symlinks; realpath flattens it so the plist
+// return a path with .. or symlinks; realpath flattens it so the login item
 // holds a stable, canonical reference.
 static NSString *gf_currentExecutablePath(void) {
     char buf[PATH_MAX];
@@ -1669,120 +1667,111 @@ static NSString *gf_currentExecutablePath(void) {
     return [NSString stringWithUTF8String:buf];
 }
 
-int gf_isLaunchAgentInstalled(void) {
-    // File presence alone isn't enough: a stale plist from a previous
-    // install (e.g. one pointing at ~/salt_development/.../bin/go_fish
-    // while the user is now running ~/Applications/go_fish) would otherwise
-    // make the menu falsely report ON. We require the plist's
-    // ProgramArguments[0] to match the currently-running binary so the
-    // toggle reflects whether *this* binary will start at boot.
-    NSString *plistPath = gf_launchAgentPath();
-    NSData *data = [NSData dataWithContentsOfFile:plistPath];
-    if (!data) return 0;
-
-    id parsed = [NSPropertyListSerialization
-        propertyListWithData:data
-                     options:NSPropertyListImmutable
-                      format:NULL
-                       error:NULL];
-    if (![parsed isKindOfClass:[NSDictionary class]]) return 0;
-
-    NSArray *args = parsed[@"ProgramArguments"];
-    if (![args isKindOfClass:[NSArray class]] || args.count == 0) return 0;
-
-    NSString *plistExe = args[0];
-    if (![plistExe isKindOfClass:[NSString class]]) return 0;
-
-    NSString *currentExe = gf_currentExecutablePath();
-    if (currentExe.length == 0) return 0;
-
-    return [plistExe isEqualToString:currentExe] ? 1 : 0;
+static NSURL *gf_currentExecutableURL(void) {
+    NSString *p = gf_currentExecutablePath();
+    if (p.length == 0) return nil;
+    return [NSURL fileURLWithPath:p];
 }
 
-int gf_installLaunchAgent(void) {
-    NSString *exe = gf_currentExecutablePath();
-    if (exe.length == 0) {
-        fprintf(stderr, "go_fish: could not determine executable path for LaunchAgent\n");
-        return -1;
+// Find the login-item entry whose resolved path equals targetPath. Returns a
+// retained LSSharedFileListItemRef (caller CFReleases) or NULL. `list` is
+// borrowed. We match on the resolved filesystem path rather than the item's
+// display name so a stale entry pointing at a different binary location
+// doesn't masquerade as ours.
+static LSSharedFileListItemRef gf_copyLoginItemMatching(LSSharedFileListRef list,
+                                                        NSString *targetPath) {
+    UInt32 seed = 0;
+    CFArrayRef items = LSSharedFileListCopySnapshot(list, &seed);
+    if (!items) return NULL;
+    LSSharedFileListItemRef match = NULL;
+    for (CFIndex i = 0; i < CFArrayGetCount(items); i++) {
+        LSSharedFileListItemRef item =
+            (LSSharedFileListItemRef)CFArrayGetValueAtIndex(items, i);
+        CFURLRef cfURL = LSSharedFileListItemCopyResolvedURL(
+            item, kLSSharedFileListNoUserInteraction
+                | kLSSharedFileListDoNotMountVolumes, NULL);
+        if (!cfURL) continue;
+        NSString *itemPath = [(__bridge_transfer NSURL *)cfURL path];
+        if ([itemPath isEqualToString:targetPath]) {
+            match = (LSSharedFileListItemRef)CFRetain(item);
+            break;
+        }
     }
-
-    NSString *home      = NSHomeDirectory();
-    NSString *plistPath = gf_launchAgentPath();
-    NSString *laDir     = [home stringByAppendingPathComponent:@"Library/LaunchAgents"];
-    NSString *logDir    = [home stringByAppendingPathComponent:@"Library/Logs"];
-    NSString *stdoutLog = [logDir stringByAppendingPathComponent:@"go_fish.out.log"];
-    NSString *stderrLog = [logDir stringByAppendingPathComponent:@"go_fish.err.log"];
-
-    NSFileManager *fm = [NSFileManager defaultManager];
-    [fm createDirectoryAtPath:laDir  withIntermediateDirectories:YES attributes:nil error:nil];
-    [fm createDirectoryAtPath:logDir withIntermediateDirectories:YES attributes:nil error:nil];
-
-    // ThrottleInterval gives launchd a 30 s floor between successive
-    // launches. Combined with the in-binary 3-attempt cap (see main.go),
-    // a binary that can't pass its permission preflight will quietly
-    // give up rather than spiral.
-    NSDictionary *plist = @{
-        @"Label":             kLaunchAgentLabel,
-        @"ProgramArguments":  @[exe],
-        @"RunAtLoad":         @YES,
-        @"KeepAlive":         @{@"SuccessfulExit": @NO},
-        @"ThrottleInterval":  @30,
-        @"ProcessType":       @"Interactive",
-        @"StandardOutPath":   stdoutLog,
-        @"StandardErrorPath": stderrLog,
-    };
-
-    NSError *err = nil;
-    NSData *data = [NSPropertyListSerialization
-        dataWithPropertyList:plist
-                      format:NSPropertyListXMLFormat_v1_0
-                     options:0
-                       error:&err];
-    if (!data) {
-        fprintf(stderr, "go_fish: plist serialize failed: %s\n",
-                err.localizedDescription.UTF8String ?: "(unknown)");
-        return -1;
-    }
-    if (![data writeToFile:plistPath atomically:YES]) {
-        fprintf(stderr, "go_fish: failed to write %s\n", plistPath.UTF8String);
-        return -1;
-    }
-    fprintf(stderr, "go_fish: wrote %s — takes effect on next login.\n",
-            plistPath.UTF8String);
-    return 0;
+    CFRelease(items);
+    return match;
 }
 
-int gf_uninstallLaunchAgent(void) {
-    NSString *plistPath = gf_launchAgentPath();
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:plistPath]) return 0;
+int gf_isLoginItemInstalled(void) {
+    NSString *path = gf_currentExecutablePath();
+    if (path.length == 0) return 0;
+    LSSharedFileListRef list =
+        LSSharedFileListCreate(NULL, kLSSharedFileListSessionLoginItems, NULL);
+    if (!list) return 0;
+    LSSharedFileListItemRef item = gf_copyLoginItemMatching(list, path);
+    int found = item ? 1 : 0;
+    if (item) CFRelease(item);
+    CFRelease(list);
+    return found;
+}
 
-    // If we're currently running under launchd, schedule a bootout so we
-    // won't be relaunched. bootout is asynchronous and will terminate us;
-    // we run it via NSTask without waiting, then return so the menu item
-    // updates first. If we're standalone (parent is not launchd), skip
-    // bootout — there's nothing to detach from.
-    if (getppid() == 1) {
-        NSTask *task = [[NSTask alloc] init];
-        task.launchPath = @"/bin/launchctl";
-        task.arguments  = @[@"bootout",
-                            [NSString stringWithFormat:@"gui/%d/%@",
-                             getuid(), kLaunchAgentLabel]];
-        task.standardOutput = [NSPipe pipe];
-        task.standardError  = [NSPipe pipe];
-        NSError *e = nil;
-        [task launchAndReturnError:&e]; // fire-and-forget
-    }
-
-    NSError *err = nil;
-    if (![fm removeItemAtPath:plistPath error:&err]) {
-        fprintf(stderr, "go_fish: failed to remove %s: %s\n",
-                plistPath.UTF8String,
-                err.localizedDescription.UTF8String ?: "(unknown)");
+int gf_installLoginItem(void) {
+    NSURL *url = gf_currentExecutableURL();
+    if (!url) {
+        fprintf(stderr, "go_fish: could not determine executable path for login item\n");
         return -1;
     }
-    fprintf(stderr, "go_fish: removed %s\n", plistPath.UTF8String);
-    return 0;
+    LSSharedFileListRef list =
+        LSSharedFileListCreate(NULL, kLSSharedFileListSessionLoginItems, NULL);
+    if (!list) {
+        fprintf(stderr, "go_fish: could not open the Login Items list\n");
+        return -1;
+    }
+    // Idempotent: if our binary is already registered, treat as success.
+    LSSharedFileListItemRef existing = gf_copyLoginItemMatching(list, url.path);
+    if (existing) {
+        CFRelease(existing);
+        CFRelease(list);
+        return 0;
+    }
+    LSSharedFileListItemRef added = LSSharedFileListInsertItemURL(
+        list, kLSSharedFileListItemLast, NULL, NULL,
+        (__bridge CFURLRef)url, NULL, NULL);
+    int rc = added ? 0 : -1;
+    if (added) CFRelease(added);
+    CFRelease(list);
+    if (rc == 0) {
+        fprintf(stderr, "go_fish: added login item %s — takes effect on next login.\n",
+                url.path.UTF8String);
+    } else {
+        fprintf(stderr, "go_fish: failed to add login item\n");
+    }
+    return rc;
+}
+
+int gf_uninstallLoginItem(void) {
+    NSString *path = gf_currentExecutablePath();
+    if (path.length == 0) return -1;
+    LSSharedFileListRef list =
+        LSSharedFileListCreate(NULL, kLSSharedFileListSessionLoginItems, NULL);
+    if (!list) {
+        fprintf(stderr, "go_fish: could not open the Login Items list\n");
+        return -1;
+    }
+    LSSharedFileListItemRef item = gf_copyLoginItemMatching(list, path);
+    int rc = 0;
+    if (item) {
+        OSStatus s = LSSharedFileListItemRemove(list, item);
+        CFRelease(item);
+        if (s != noErr) {
+            fprintf(stderr, "go_fish: failed to remove login item (status %d)\n", (int)s);
+            rc = -1;
+        } else {
+            fprintf(stderr, "go_fish: removed login item %s\n", path.UTF8String);
+        }
+    }
+    // Not present == already uninstalled == success.
+    CFRelease(list);
+    return rc;
 }
 
 // Build a template menu-bar image from arbitrary image bytes.
@@ -1970,7 +1959,7 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
                                                       action:@selector(toggleStartAtBoot:)
                                                keyEquivalent:@""];
     bootItem.target = gStatusHandler;
-    bootItem.state  = gf_isLaunchAgentInstalled()
+    bootItem.state  = gf_isLoginItemInstalled()
         ? NSControlStateValueOn : NSControlStateValueOff;
     gStatusHandler.bootItem = bootItem;
     [menu addItem:bootItem];
