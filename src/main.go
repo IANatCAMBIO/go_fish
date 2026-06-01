@@ -2,7 +2,7 @@ package main
 
 /*
 #cgo CFLAGS: -x objective-c -fobjc-arc -Wno-deprecated-declarations
-#cgo LDFLAGS: -framework Cocoa -framework ApplicationServices -framework CoreGraphics
+#cgo LDFLAGS: -framework Cocoa -framework ApplicationServices -framework CoreGraphics -framework CoreServices
 #include "cocoa.h"
 */
 import "C"
@@ -22,11 +22,12 @@ import (
 //go:embed hook.png
 var menuIcon []byte
 
-// LaunchAgent crash-loop guard. We give the permission preflight at most
-// `attemptsCap` shots, with linear-ish backoff between launches (0s, 1s,
-// 2s). If we're still failing after that, we exit(0) so launchd's
-// SuccessfulExit=false keep-alive stops restarting us. A successful run
-// (past the preflight) resets the counter.
+// Permission-prompt guard. As a login item we launch once per login; if we
+// can't pass the permission preflight we'd otherwise re-prompt on every login
+// (or every manual relaunch) indefinitely. We give the preflight at most
+// `attemptsCap` shots, with linear-ish backoff between launches (0s, 1s, 2s),
+// then exit(0) and reset the counter so the next login starts fresh rather
+// than spamming prompts. A successful run (past the preflight) resets it.
 const attemptsCap = 3
 
 func attemptsFile() string {

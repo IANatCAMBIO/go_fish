@@ -24,9 +24,10 @@ the same app.
   automatically
 - **Menu-bar entry** with Show Window Grid, Minimize All, Cascade All,
   Start at boot, Secure Event Input detection, and Quit
-- **Opt-in auto-launch** — toggle **Start at boot** in the menu to
-  install a LaunchAgent (with a built-in 3-attempt backoff so a missing
-  permission can never turn into a restart loop)
+- **Opt-in auto-launch** — toggle **Start at boot** in the menu to add
+  go_fish to your Login Items (System Settings > General > Login Items),
+  with a built-in 3-attempt backoff so a missing permission can never
+  turn into a per-login prompt loop
 - **Secure Event Input awareness** — when an app holds Secure Event
   Input (Terminal during `sudo`, password managers, some VPN clients),
   Cmd+Tab is invisible to *any* third-party event tap. go_fish polls
@@ -45,15 +46,15 @@ the same app.
 
 ```sh
 # Build + install in one shot (compiles ./src → ./bin/go_fish, then
-# copies to ~/Applications/go_fish). No sudo, no LaunchAgent by default.
+# copies to ~/Applications/go_fish). No sudo, no auto-launch by default.
 # Requires Go 1.22+ and Xcode Command Line Tools.
 ./install.sh --build
 
 # Or, if you already have a prebuilt binary at ./bin/go_fish:
 ./install.sh
 
-# Total uninstall (kills process, removes LaunchAgent if installed,
-# removes binary, prompts to remove logs):
+# Total uninstall (kills process, removes the Login Items entry + any
+# legacy LaunchAgent, removes binary, prompts to remove logs):
 ./install.sh uninstall
 ```
 
@@ -129,11 +130,12 @@ CoreGraphics:
 - **Activation** — `kAXMinimizedAttribute = false` + `kAXRaiseAction` +
   `NSRunningApplication.activateWithOptions:`; macOS handles the Space
   switch as a side-effect
-- **Optional auto-launch** — the **Start at boot** menu item writes
-  `~/Library/LaunchAgents/com.local.gofish.plist` pointing at the
-  running binary's `realpath`. The plist sets `ThrottleInterval=30`,
-  and the binary itself tracks permission-failure attempts in
+- **Optional auto-launch** — the **Start at boot** menu item adds the
+  running binary's `realpath` to the per-user Login Items list via the
+  `LSSharedFileList` session list (the only programmatic path that works
+  for a bare binary; `SMAppService` requires a real `.app` bundle). The
+  binary tracks permission-failure attempts in
   `~/Library/Application Support/go_fish/attempts.txt`, giving up
-  cleanly (`exit 0`) after the 3rd failed preflight so launchd's
-  `SuccessfulExit=false` doesn't loop.
+  cleanly (`exit 0`) after the 3rd failed preflight so a missing grant
+  can't re-prompt on every login.
 
