@@ -56,7 +56,7 @@ static void *buildPanelData(void) {
     for (int i = 0; i < gSwCount; i++) {
         gf_window_t *w = &gSwList[i];
         gf_setPanelEntry(data, i, w->title, w->appName, w->axRef, w->windowID,
-                         w->minimized, w->pid, w->unresponsive);
+                         w->minimized, w->pid, w->unresponsive, w->windowless);
     }
     return data;
 }
@@ -195,11 +195,16 @@ int gfOnClose(int idx) {
         pthread_mutex_unlock(&gSwMu);
         return 0;
     }
-    // Fire the AX close; gf_closeWindow retains internally so it's safe to
-    // release our reference immediately afterwards. Then free the strings and
-    // splice the entry out of the list.
-    gf_closeWindow(gSwList[idx].axRef);
-    gf_release(gSwList[idx].axRef);
+    // Windowless app placeholders have no window to close, so "closing" one
+    // quits the app (like Cmd+Q). Real windows fire the AX close button;
+    // gf_closeWindow retains internally so it's safe to release our reference
+    // immediately afterwards. Then free the strings and splice the entry out.
+    if (gSwList[idx].windowless) {
+        gf_quitApp(gSwList[idx].pid);
+    } else {
+        gf_closeWindow(gSwList[idx].axRef);
+        gf_release(gSwList[idx].axRef);
+    }
     free(gSwList[idx].title);
     free(gSwList[idx].appName);
     memmove(&gSwList[idx], &gSwList[idx + 1],

@@ -16,6 +16,9 @@ typedef struct {
     int          onScreen;    // 0 / 1
     int          zOrder;      // smaller = closer to front
     int          unresponsive;// 0 / 1; if 1, axRef is NULL and entry is a per-app placeholder
+    int          windowless;  // 0 / 1; if 1, a running regular app with no windows.
+                              // axRef is NULL and the entry is a per-app placeholder;
+                              // activating just brings the app forward.
 } gf_window_t;
 
 // Permissions.
@@ -41,7 +44,7 @@ void *gf_newPanelData(int count);
 void  gf_setPanelEntry(void *data, int idx,
                        const char *title, const char *appName,
                        void *axRef, unsigned int windowID,
-                       int minimized, int pid, int unresponsive);
+                       int minimized, int pid, int unresponsive, int windowless);
 void  gf_showPanel(void *data, int selected);
 // In-place entry refresh without resizing/recentering the panel. Used after
 // closing a window so the grid updates without a visible jump.
@@ -56,6 +59,10 @@ void gf_activateWindow(void *axRef, int pid, int minimized);
 // Close. Presses the target window's AX close button. Caller retains ownership
 // of axRef (this function does not release it).
 void gf_closeWindow(void *axRef);
+
+// Quit. Gracefully terminates the app (like Cmd+Q). Used to "close" windowless
+// app placeholders, which have no window to close.
+void gf_quitApp(int pid);
 
 // Bulk window arrangement, driven by the menu-bar status item.
 // Both operate on every standard window of every regular app (same filter

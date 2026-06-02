@@ -89,6 +89,9 @@ static NSImage         *gIconSEI       = nil;  // composite with red X
 static NSTimer         *gSEITimer      = nil;
 static atomic_int       gSEIDetection  = 1;    // user preference
 static atomic_int       gSEIActive     = 0;    // last observed state
+static atomic_int       gShowWindowlessApps = 0; // user preference: surface
+                                                 // running regular apps that
+                                                 // have no windows as tiles.
 
 @class GFMRUTracker;
 static NSMutableArray<NSNumber *>            *gMRU         = nil;  // CGWindowIDs, front-to-back MRU
@@ -103,11 +106,18 @@ static NSMutableArray<NSNumber *>                 *gThumbLRU   = nil; // winIDs,
 static NSMutableDictionary<NSNumber *, NSDate *>  *gThumbAge   = nil; // winID -> last-captured time
 static const NSUInteger                            kThumbCap        = 30;
 static const NSTimeInterval                        kThumbStaleAfter = 30.0; // seconds
+// After the panel has been closed this long, drop the whole cache so an idle
+// go_fish returns to its baseline footprint instead of pinning ~tens of MB of
+// bitmaps. Cancelled whenever the panel reopens; quick re-opens stay warm.
+static NSTimer                                    *gThumbPurgeTimer = nil;
+static const NSTimeInterval                        kThumbIdlePurgeAfter = 45.0; // seconds
 
 // Forward declarations — these are used by the panel UI, which is defined
 // before the thumbnail-cache and MRU sections.
 static void gf_pushMRU(CGWindowID winID);
 static void gf_captureAsync(CGWindowID winID);
+static void gf_scheduleThumbPurge(void);
+static void gf_cancelThumbPurge(void);
 
 // =========================================================================
 // Permissions
@@ -221,6 +231,7 @@ typedef struct {
     int            minimized;
     int            onScreen;
     int            unresponsive;
+    int            windowless;  // running regular app with no windows
     NSInteger      mruPos;      // NSNotFound if not in MRU
     int            cgOrder;     // -1 if not in cgIndex (off-screen / minimized)
 } gf_pending_t;
@@ -230,6 +241,33 @@ typedef struct {
     int           count;
     int           cap;
 } gf_slot_t;
+
+// Fill an app's (empty) slot with a single windowless placeholder. Used when
+// "Show apps without windows" is on and a responsive regular app turned up no
+// standard windows. Mirrors the unresponsive placeholder, but with no
+// "not responding" treatment — activating it just brings the app forward.
+// Caller guarantees s->count is 0.
+static void gf_addWindowlessSlot(gf_slot_t *s, NSRunningApplication *app, pid_t pid) {
+    if (app.localizedName.length == 0) return;
+    if (s->cap < 1) {
+        free(s->items);  // free(NULL) is a no-op; also reclaims a calloc(0) stub
+        s->items = (gf_pending_t *)calloc(1, sizeof(gf_pending_t));
+        s->cap = 1;
+    }
+    gf_pending_t *p = &s->items[0];
+    p->pid          = (int)pid;
+    p->axRef        = NULL;
+    p->windowID     = 0;
+    p->title        = strdup([app.localizedName UTF8String]);
+    p->appName      = strdup([app.localizedName UTF8String]);
+    p->minimized    = 0;
+    p->onScreen     = 0;
+    p->unresponsive = 0;
+    p->windowless   = 1;
+    p->mruPos       = NSNotFound;
+    p->cgOrder      = -1;
+    s->count = 1;
+}
 
 gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
     *out_count = 0;
@@ -302,6 +340,11 @@ gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
                 pid_t pid = app.processIdentifier;
                 gf_slot_t *s = &slots[i];
 
+                // Only in the all-apps grid (filterPID == 0) do we surface a
+                // running regular app with no windows as a placeholder tile.
+                BOOL wantWindowless =
+                    (filterPID == 0) && atomic_load(&gShowWindowlessApps);
+
                 AXUIElementRef axApp = AXUIElementCreateApplication(pid);
                 if (!axApp) return;
                 AXUIElementSetMessagingTimeout(axApp, kAXAppTimeout);
@@ -334,6 +377,9 @@ gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
                     return;
                 }
                 if (err != kAXErrorSuccess || !axWins) {
+                    // Responsive, but reports no windows attribute at all.
+                    if (wantWindowless) gf_addWindowlessSlot(s, app, pid);
+                    if (axWins) CFRelease(axWins);
                     CFRelease(axApp);
                     return;
                 }
@@ -389,11 +435,16 @@ gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
                     p->minimized    = minimized ? 1 : 0;
                     p->onScreen     = onScreen  ? 1 : 0;
                     p->unresponsive = 0;
+                    p->windowless   = 0;
                     p->mruPos       = mruIdx ? (NSInteger)mruIdx.unsignedIntegerValue : NSNotFound;
                     p->cgOrder      = order ? order.intValue : -1;
                     s->count++;
                 }
                 CFRelease(axWins);
+                // Had a windows attribute, but every window was filtered out
+                // (non-standard subrole, no title). Treat as windowless.
+                if (s->count == 0 && wantWindowless)
+                    gf_addWindowlessSlot(s, app, pid);
                 CFRelease(axApp);
             }
         });
@@ -417,10 +468,14 @@ gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
                 e->minimized    = p->minimized;
                 e->onScreen     = p->onScreen;
                 e->unresponsive = p->unresponsive;
+                e->windowless   = p->windowless;
 
                 int zOrder;
                 if (p->unresponsive) {
                     zOrder = 900000 + fallbackZ;
+                } else if (p->windowless) {
+                    // After all real windows, before unresponsive apps.
+                    zOrder = 800000 + fallbackZ;
                 } else if (p->mruPos != NSNotFound) {
                     zOrder = (int)p->mruPos;
                 } else if (p->cgOrder >= 0) {
@@ -467,15 +522,9 @@ void gf_release(void *axRef) {
 @property (nonatomic, assign) BOOL minimized;
 @property (nonatomic, assign) BOOL thumbLoaded;
 @property (nonatomic, assign) BOOL unresponsive;
+@property (nonatomic, assign) BOOL windowless;
 @end
 @implementation GFEntry @end
-
-@interface GFPanelView : NSView
-@property (nonatomic, assign) NSInteger selected;
-@property (nonatomic, strong) NSArray<GFEntry *> *entries;
-@property (nonatomic, strong) NSTrackingArea *trackingArea;
-- (void)updateSelection:(NSInteger)idx;
-@end
 
 // Layout values. Kept as a single struct so drawing and hit-testing agree.
 // appH is the band above the thumbnail that holds the application name;
@@ -486,6 +535,18 @@ typedef struct {
     CGFloat tileW, tileH, cellH;
     CGFloat topY;
 } gf_layout_t;
+
+@interface GFPanelView : NSView
+@property (nonatomic, assign) NSInteger selected;
+@property (nonatomic, strong) NSArray<GFEntry *> *entries;
+@property (nonatomic, strong) NSTrackingArea *trackingArea;
+// Layout frozen at show time. Column count and tile size stay fixed for the
+// panel's lifetime so closing a thumbnail reflows the rest up-and-left without
+// recentering or resizing. Reset on each show.
+@property (nonatomic, assign) gf_layout_t baseLayout;
+@property (nonatomic, assign) BOOL hasBaseLayout;
+- (void)updateSelection:(NSInteger)idx;
+@end
 
 // Column count for an N-entry grid. Slight landscape bias (ratio target ~1.5)
 // and capped at 7 to keep titles legible.
@@ -518,7 +579,9 @@ static NSSize gf_preferredPanelSize(NSInteger n) {
 - (BOOL)isFlipped { return NO; }
 - (BOOL)acceptsFirstMouse:(NSEvent *)e { return YES; }
 
-- (gf_layout_t)layoutForCount:(NSInteger)n {
+// Compute a layout sized for `n` tiles in the current bounds. Used to freeze
+// the layout at show time; afterwards layoutForCount: returns the cached one.
+- (gf_layout_t)computeLayoutForCount:(NSInteger)n {
     gf_layout_t L = {0};
     NSRect b = self.bounds;
     L.margin = 24;
@@ -541,9 +604,19 @@ static NSSize gf_preferredPanelSize(NSInteger n) {
     L.tileH = L.tileW * 0.65;
     L.cellH = L.tileH + L.titleH + L.appH + 4;
 
-    CGFloat totalH = rows*L.cellH + (rows-1)*L.gap;
-    L.topY = b.size.height/2 + totalH/2;
+    // Top-anchored: the first row's top sits at the top margin and rows grow
+    // downward. Keeps the grid pinned up-and-left so closing tiles never
+    // recenters the survivors.
+    L.topY = b.size.height - L.margin;
     return L;
+}
+
+// The layout drawing and hit-testing should use. Once frozen at show time the
+// cached layout is returned verbatim, so column count and tile size stay put
+// as the entry count shrinks on close.
+- (gf_layout_t)layoutForCount:(NSInteger)n {
+    if (self.hasBaseLayout) return self.baseLayout;
+    return [self computeLayoutForCount:n];
 }
 
 // Image rect for tile i. Bottom of the tile is at the same y as the label,
@@ -708,8 +781,9 @@ static void gf_initDrawAttrs(void) {
             [e.appName drawInRect:appR withAttributes:gAppAttrs];
         }
 
-        // Close button: only drawn for entries we can actually close (i.e.
-        // not unresponsive placeholders, which have no AX ref).
+        // Close button: drawn for everything except unresponsive placeholders
+        // (which have no AX ref and can't be acted on). Windowless tiles get
+        // one too — closing them quits the app.
         if (!e.unresponsive) {
             NSBezierPath *circle = [NSBezierPath bezierPathWithOvalInRect:closeR];
             [[NSColor colorWithWhite:0.0 alpha:0.60] setFill];
@@ -812,6 +886,7 @@ typedef struct {
     int           minimized;
     int           pid;
     int           unresponsive;
+    int           windowless;
 } gf_pe_t;
 typedef struct {
     gf_pe_t *entries;
@@ -828,7 +903,7 @@ void *gf_newPanelData(int count) {
 void gf_setPanelEntry(void *data, int idx,
                       const char *title, const char *appName,
                       void *axRef, unsigned int windowID,
-                      int minimized, int pid, int unresponsive) {
+                      int minimized, int pid, int unresponsive, int windowless) {
     gf_pd_t *d = (gf_pd_t *)data;
     d->entries[idx].title        = strdup(title ?: "");
     d->entries[idx].appName      = strdup(appName ?: "");
@@ -837,6 +912,7 @@ void gf_setPanelEntry(void *data, int idx,
     d->entries[idx].minimized    = minimized;
     d->entries[idx].pid          = pid;
     d->entries[idx].unresponsive = unresponsive;
+    d->entries[idx].windowless   = windowless;
 }
 
 static void freePanelData(gf_pd_t *d) {
@@ -862,6 +938,7 @@ static NSArray<GFEntry *> *gf_buildEntries(gf_pd_t *d) {
         ge.pid          = e->pid;
         ge.minimized    = e->minimized != 0;
         ge.unresponsive = e->unresponsive != 0;
+        ge.windowless   = e->windowless != 0;
 
         NSImage *cached = nil;
         if (!ge.minimized && e->windowID != 0) {
@@ -900,11 +977,35 @@ static void gf_fireCaptureRefresh(NSArray<GFEntry *> *items) {
     }
 }
 
+// Main-thread only. Cache-purge bookkeeping; see kThumbIdlePurgeAfter.
+static void gf_cancelThumbPurge(void) {
+    if (gThumbPurgeTimer) {
+        [gThumbPurgeTimer invalidate];
+        gThumbPurgeTimer = nil;
+    }
+}
+
+static void gf_scheduleThumbPurge(void) {
+    gf_cancelThumbPurge();
+    gThumbPurgeTimer = [NSTimer scheduledTimerWithTimeInterval:kThumbIdlePurgeAfter
+                                                       repeats:NO
+                                                         block:^(NSTimer *_t) {
+        gThumbPurgeTimer = nil;
+        // Re-check: a show may have raced in just before the timer fired.
+        if (atomic_load(&gActive)) return;
+        [gThumbCache removeAllObjects];
+        [gThumbLRU   removeAllObjects];
+        [gThumbAge   removeAllObjects];
+    }];
+}
+
 void gf_showPanel(void *data, int selected) {
     gf_pd_t *d = (gf_pd_t *)data;
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             ensurePanel();
+            // Keep the cache alive while the panel is in use.
+            gf_cancelThumbPurge();
 
             NSArray<GFEntry *> *items = gf_buildEntries(d);
             gPanelView.entries  = items;
@@ -926,6 +1027,12 @@ void gf_showPanel(void *data, int selected) {
                                   vf.origin.y + (vf.size.height - ps.height)/2,
                                   ps.width, ps.height);
             [gPanel setFrame:r display:NO];
+
+            // Freeze the layout for this activation now that the frame (and
+            // thus the view bounds) is final. Subsequent closes keep these
+            // column/tile dimensions, so survivors stay pinned up-and-left.
+            gPanelView.baseLayout    = [gPanelView computeLayoutForCount:d->count];
+            gPanelView.hasBaseLayout = YES;
 
             [gPanelView setNeedsDisplay:YES];
             [gPanel orderFrontRegardless];
@@ -968,9 +1075,13 @@ void gf_hidePanel(void) {
             // freed; on retina screens these add up fast (~800 KB each).
             for (GFEntry *e in gPanelView.entries) { e.image = nil; }
             gPanelView.entries = nil;
+            // Drop the frozen layout so the next show recomputes from scratch.
+            gPanelView.hasBaseLayout = NO;
             [gPanelView setNeedsDisplay:YES];
         }
         if (gPanel) [gPanel orderOut:nil];
+        // Reclaim the thumbnail cache once the panel has stayed closed a while.
+        gf_scheduleThumbPurge();
     });
 }
 
@@ -1035,6 +1146,17 @@ void gf_closeWindow(void *axRefPtr) {
                 CFRelease(closeBtn);
             }
             CFRelease(w);
+        }
+    });
+}
+
+void gf_quitApp(int pid) {
+    if (pid <= 0) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            NSRunningApplication *app = [NSRunningApplication
+                runningApplicationWithProcessIdentifier:(pid_t)pid];
+            [app terminate];
         }
     });
 }
@@ -1282,7 +1404,9 @@ void gf_cascadeAll(void) {
 static NSImage *gf_makeThumbFromCG(CGImageRef src) {
     if (!src) return nil;
     size_t sw = CGImageGetWidth(src), sh = CGImageGetHeight(src);
-    const size_t kMaxDim = 600;
+    // Matches the largest a tile is ever drawn: tileW caps at 240pt, i.e. 480px
+    // on a 2x Retina display. Capturing larger just wastes cache memory.
+    const size_t kMaxDim = 480;
     CGFloat scale = MIN((CGFloat)kMaxDim / sw, (CGFloat)kMaxDim / sh);
     CGImageRef thumb = NULL;
     if (scale >= 1.0) {
@@ -1389,6 +1513,11 @@ static void gf_bootstrapCapture(void) {
             }
         });
     }
+    // If the user never opens the panel, don't pin the bootstrap thumbnails
+    // forever — let the idle purge reclaim them.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!atomic_load(&gActive)) gf_scheduleThumbPurge();
+    });
 }
 
 // =========================================================================
@@ -1578,10 +1707,12 @@ static void gf_setupMRUTracking(void) {
 @interface GFStatusHandler : NSObject
 @property (nonatomic, weak) NSMenuItem *seiItem;
 @property (nonatomic, weak) NSMenuItem *bootItem;
+@property (nonatomic, weak) NSMenuItem *windowlessItem;
 - (void)showGrid:(id)sender;
 - (void)minimizeAll:(id)sender;
 - (void)cascadeAll:(id)sender;
 - (void)toggleSEIDetection:(id)sender;
+- (void)toggleWindowlessApps:(id)sender;
 - (void)toggleStartAtBoot:(id)sender;
 - (void)quit:(id)sender;
 @end
@@ -1599,6 +1730,13 @@ static void gf_applySEIState(BOOL active);
 }
 - (void)minimizeAll:(id)sender { gf_minimizeAll(); }
 - (void)cascadeAll:(id)sender  { gf_cascadeAll();  }
+- (void)toggleWindowlessApps:(id)sender {
+    int next = atomic_load(&gShowWindowlessApps) ? 0 : 1;
+    atomic_store(&gShowWindowlessApps, next);
+    [[NSUserDefaults standardUserDefaults] setBool:(next ? YES : NO)
+                                            forKey:@"ShowWindowlessApps"];
+    self.windowlessItem.state = next ? NSControlStateValueOn : NSControlStateValueOff;
+}
 - (void)toggleSEIDetection:(id)sender {
     int next = atomic_load(&gSEIDetection) ? 0 : 1;
     atomic_store(&gSEIDetection, next);
@@ -1929,8 +2067,11 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
 
     // Restore the user's preference (default: enabled).
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    [defaults registerDefaults:@{@"SEIDetection": @YES}];
+    [defaults registerDefaults:@{@"SEIDetection": @YES,
+                                 @"ShowWindowlessApps": @NO}];
     atomic_store(&gSEIDetection, [defaults boolForKey:@"SEIDetection"] ? 1 : 0);
+    atomic_store(&gShowWindowlessApps,
+                 [defaults boolForKey:@"ShowWindowlessApps"] ? 1 : 0);
 
     NSMenu *menu = [[NSMenu alloc] init];
     NSMenuItem *showItem = [[NSMenuItem alloc] initWithTitle:@"Show Window Grid"
@@ -1972,6 +2113,16 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
         ? NSControlStateValueOn : NSControlStateValueOff;
     gStatusHandler.seiItem = seiItem;
     [menu addItem:seiItem];
+
+    NSMenuItem *windowlessItem =
+        [[NSMenuItem alloc] initWithTitle:@"Show apps without windows"
+                                   action:@selector(toggleWindowlessApps:)
+                            keyEquivalent:@""];
+    windowlessItem.target = gStatusHandler;
+    windowlessItem.state  = atomic_load(&gShowWindowlessApps)
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    gStatusHandler.windowlessItem = windowlessItem;
+    [menu addItem:windowlessItem];
 
     [menu addItem:[NSMenuItem separatorItem]];
 
