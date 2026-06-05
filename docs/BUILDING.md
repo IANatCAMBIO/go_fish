@@ -3,35 +3,40 @@
 ## Requirements
 
 - macOS 12 or later (tested on macOS 14/15, arm64 and x86_64)
-- Xcode Command Line Tools (`xcode-select --install`) — provides clang, `make`,
-  `xxd`, and the macOS SDK
+- Xcode Command Line Tools (`xcode-select --install`) — provides clang, `xxd`,
+  `sips`, `iconutil`, and the macOS SDK
 - No third-party dependencies: the build is pure Objective-C against system
   frameworks
 
 ## Build
 
-Source code lives under `src/`. From the repo root:
+Source code lives under `src/`. From the repo root, one script does
+everything:
 
 ```sh
-( cd src && make )
+./build.sh               # compiles ./src → ./go_fish.app
 ```
 
-…which is exactly what `./install.sh --build` does for you. The `Makefile`
-generates `hook_png.h` (the embedded menu-bar icon, via `xxd -i hook.png`),
-then compiles `main.m`, `cocoa.m`, and `switcher.m` with clang into a single
-`bin/go_fish` binary (~130 KB).
+`build.sh` generates `hook_png.h` (the embedded menu-bar icon, via
+`xxd -i hook.png`), compiles `main.m`, `cocoa.m`, and `switcher.m` with clang
+(the executable is ~130 KB), and assembles the bundle in the repo root:
+`go_fish.app/Contents/MacOS/go_fish`, `Contents/Info.plist` (copied from
+`src/Info.plist`), and `Contents/Resources/AppIcon.icns`. The icon is built
+from the *same* `hook.png` the menu bar uses: `sips` renders the ten required
+sizes into an `.iconset` and `iconutil` packs them into `AppIcon.icns`
+(referenced via `CFBundleIconFile` in the plist). Because the hook is a
+transparent black silhouette it reads well on light backgrounds and faintly on
+dark ones — swap in a backed PNG if you want more contrast. Finally the bundle
+is ad-hoc signed. The bundle is what makes go_fish launch as a Login Item with
+no Terminal window; see
+[USAGE.md](USAGE.md#auto-launch-on-login-start-at-boot).
 
-To strip symbols and shrink further:
-
-```sh
-( cd src && make && strip ../bin/go_fish )
-```
-
-`make clean` removes the binary and the generated `hook_png.h`.
+`build.sh` rebuilds `go_fish.app` from scratch each run (`rm -rf` first), so
+there's no separate clean step; `hook_png.h` is left in `src/` (gitignored).
 
 ### What it links against
 
-The `Makefile` links these system frameworks:
+`build.sh` links these system frameworks:
 
 - `Cocoa` — NSApplication, NSPanel, NSImage
 - `ApplicationServices` — Accessibility (AX) API
@@ -47,8 +52,9 @@ The long-term migration is to ScreenCaptureKit.
 
 The build passes `-Wno-deprecated-declarations` because both the `dlsym`'d
 capture path and the `LSSharedFileList` login-item calls are formally
-deprecated but still functional (and, for a bare binary, the only option —
-`SMAppService` requires a real `.app` bundle).
+deprecated but still functional. (`SMAppService` is the modern login-item
+API and would work now that go_fish ships as a bundle, but `LSSharedFileList`
+remains in place as the lighter-touch change.)
 
 ## Troubleshooting builds
 
@@ -76,8 +82,9 @@ sudo xcode-select --install
 
 ### Cross-architecture build
 
-clang produces a universal binary directly — add both arches to the compile.
-One-off:
+clang produces a universal binary directly — add both arches to the `clang`
+invocation in `build.sh` (the `-fobjc-arc -Wall …` line): append
+`-arch arm64 -arch x86_64`. For a one-off without editing the script:
 
 ```sh
 ( cd src && xxd -i hook.png > hook_png.h && \
@@ -85,10 +92,8 @@ One-off:
     main.m cocoa.m switcher.m \
     -framework Cocoa -framework ApplicationServices \
     -framework CoreGraphics -framework CoreServices \
-    -o ../bin/go_fish )
+    -o ../go_fish.app/Contents/MacOS/go_fish )
 ```
-
-(or append `-arch arm64 -arch x86_64` to `CFLAGS` in the `Makefile`).
 
 ## Code signing
 
@@ -103,11 +108,10 @@ binary is signed:
 | Self-signed cert from Keychain    | cert's identity             | Yes               |
 | Developer ID Application          | Team ID + bundle/binary ID  | Yes               |
 
-`./install.sh` does an ad-hoc sign as the convenient default — it
-requires no setup and lets the script run unattended. The trade-off is
-that **every rebuild re-prompts** for Accessibility/Screen Recording,
-because the CDHash changes. The fix is documented in
-`USAGE.md` → *After granting permissions, it still complains*.
+`./build.sh` does an ad-hoc sign as the convenient default — it
+requires no setup. The trade-off is that **every rebuild re-prompts** for
+Accessibility/Screen Recording, because the CDHash changes. The fix is
+documented in `USAGE.md` → *After granting permissions, it still complains*.
 
 ### Stable identity via a self-signed cert
 
@@ -119,15 +123,17 @@ Create a Certificate…**:
 - **Identity Type:** Self Signed Root
 - **Certificate Type:** Code Signing
 
-After creating it, sign manually before running the installer:
+After creating it, sign the bundle with it once `build.sh` has produced it.
+Since `build.sh` ad-hoc signs at the end, re-sign with your identity
+afterward (this replaces the ad-hoc signature):
 
 ```sh
-codesign --force --sign go_fish-signer bin/go_fish
-./install.sh                              # without --build, so the signed binary is what gets installed
+./build.sh
+codesign --force --deep --sign go_fish-signer go_fish.app
 ```
 
 The first run after this will prompt for permissions one more time;
-subsequent rebuilds signed with the same cert will keep them.
+subsequent rebuilds re-signed with the same cert will keep them.
 
 ### Developer ID
 
@@ -136,7 +142,7 @@ instead — same effect as a self-signed cert, plus the binary will work
 on machines other than yours:
 
 ```sh
-codesign --sign "Developer ID Application: …" --options runtime --force bin/go_fish
+codesign --sign "Developer ID Application: …" --options runtime --force --deep go_fish.app
 ```
 
 After switching signing identities (ad-hoc → self-signed, self-signed →
@@ -149,16 +155,15 @@ Recording) once.
 ```
 go_fish/
 ├── README.md
-├── install.sh             # build / install (~/Applications/go_fish) / uninstall;
-│                          #   no auto-launch by default — that's opt-in via the
+├── build.sh               # compiles ./src → ./go_fish.app; ad-hoc signs.
+│                          #   No auto-launch by default — that's opt-in via the
 │                          #   "Start at boot" menu item once go_fish is running
-├── bin/
-│   └── go_fish            # prebuilt binary; --build writes here
+├── go_fish.app            # the built bundle (produced by build.sh)
 ├── docs/
 │   ├── BUILDING.md
 │   └── USAGE.md
 └── src/
-    ├── Makefile           # clang build; generates hook_png.h, links frameworks
+    ├── Info.plist         # bundle metadata (CFBundleExecutable, LSUIElement, icon)
     ├── main.m             # entry point, permission preflight with 3-attempt
     │                      #   backoff (attempts.txt), runs NSApp
     ├── switcher.h         # declares the switcher event entry points
@@ -210,13 +215,18 @@ The seam between the switcher state machine (`switcher.m`) and the Cocoa layer
   redraws stay cheap with large grids.
 - `gf_isLoginItemInstalled()` / `gf_installLoginItem()` /
   `gf_uninstallLoginItem()` — backing the **Start at boot** menu
-  toggle. They add/remove the running binary (`_NSGetExecutablePath()`
-  resolved through `realpath`) in the per-user Login Items list via the
-  `LSSharedFileList` session list. Matching is by resolved path, so a
-  stale entry for a different binary location reports as not installed.
-  Effective on next login; the current instance is left running.
+  toggle. They add/remove the enclosing `.app` bundle in the per-user
+  Login Items list via the `LSSharedFileList` session list. The target
+  is derived from `_NSGetExecutablePath()` (resolved through `realpath`):
+  if the executable sits at `<X>.app/Contents/MacOS/<exe>`, the bundle
+  root `<X>.app` is registered so it launches with no Terminal window;
+  run loose (a bare binary, not via `build.sh`), it falls back to the
+  bare executable.
+  Matching is by resolved path, so a stale entry for a different location
+  reports as not installed. Effective on next login; the current instance
+  is left running.
 
-The menu-bar icon is embedded into the binary at build time: the `Makefile`
+The menu-bar icon is embedded into the binary at build time: `build.sh`
 runs `xxd -i hook.png` to produce `hook_png.h` (a `hook_png[]` byte array),
 which `main.m` includes and hands to `gf_run`. The resulting executable is
 fully self-contained — no asset files ship alongside it. To swap the icon,

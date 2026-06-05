@@ -45,32 +45,23 @@ the same app.
 ## Quickstart
 
 ```sh
-# Build + install in one shot (compiles ./src → ./bin/go_fish, then
-# copies to ~/Applications/go_fish). No sudo, no auto-launch by default.
-# Requires Xcode Command Line Tools (clang + make).
-./install.sh --build
+# Build go_fish.app from ./src into the repo root. No sudo.
+# Requires Xcode Command Line Tools (clang).
+./build.sh
 
-# Or, if you already have a prebuilt binary at ./bin/go_fish:
-./install.sh
-
-# Total uninstall (kills process, removes the Login Items entry + any
-# legacy LaunchAgent, removes binary, prompts to remove logs):
-./install.sh uninstall
+# Launch it (it's a menu-bar app; no auto-launch by default):
+open go_fish.app
 ```
 
-After installing, launch go_fish (it does not start automatically). For
-the first run, detach from the terminal so closing the shell doesn't
-kill the process and you don't get a noisy log stream:
-
-```sh
-nohup ~/Applications/go_fish >/dev/null 2>&1 &
-```
+`build.sh` compiles the Objective-C sources, generates the app icon from
+`src/hook.png`, assembles `./go_fish.app`, and ad-hoc signs it. Move the
+bundle wherever you like (e.g. `~/Applications`) — it's self-contained.
 
 The first launch will prompt for two permissions in **System Settings →
 Privacy & Security**:
 
-1. **Accessibility** → enable `~/Applications/go_fish`
-2. **Screen Recording** → enable `~/Applications/go_fish`
+1. **Accessibility** → enable `go_fish`
+2. **Screen Recording** → enable `go_fish`
 
 Then re-launch. Also under **System Settings → Keyboard → Keyboard
 Shortcuts**:
@@ -88,10 +79,10 @@ the menu-bar hook and check **Start at boot**.
 ```
 go_fish/
 ├── README.md
-├── install.sh             # build / install / uninstall (no auto-launch by default)
-├── bin/go_fish            # prebuilt binary (also produced by --build)
+├── build.sh               # compiles ./src → ./go_fish.app (no auto-launch by default)
+├── go_fish.app            # the built bundle (produced by build.sh)
 ├── docs/{USAGE,BUILDING}.md
-└── src/                   # Objective-C source + Makefile + embedded hook.png
+└── src/                   # Objective-C source + Info.plist + embedded hook.png
 ```
 
 ## Documentation
@@ -130,11 +121,12 @@ Written in Objective-C against AppKit, Accessibility, and CoreGraphics:
   `NSRunningApplication.activateWithOptions:`; macOS handles the Space
   switch as a side-effect
 - **Optional auto-launch** — the **Start at boot** menu item adds the
-  running binary's `realpath` to the per-user Login Items list via the
-  `LSSharedFileList` session list (the only programmatic path that works
-  for a bare binary; `SMAppService` requires a real `.app` bundle). The
-  binary tracks permission-failure attempts in
-  `~/Library/Application Support/go_fish/attempts.txt`, giving up
+  enclosing `go_fish.app` bundle to the per-user Login Items list via the
+  `LSSharedFileList` session list. Registering the *bundle* (not the bare
+  binary) is what lets it launch with no Terminal window: LaunchServices
+  runs a `.app` directly, whereas a loose Unix binary in Login Items is
+  hosted by Terminal.app. The binary tracks permission-failure attempts
+  in `~/Library/Application Support/go_fish/attempts.txt`, giving up
   cleanly (`exit 0`) after the 3rd failed preflight so a missing grant
   can't re-prompt on every login.
 

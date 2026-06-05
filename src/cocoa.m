@@ -1784,12 +1784,19 @@ static void gf_applySEIState(BOOL active);
 // Login-item management ("Start at boot")
 // =========================================================================
 //
-// We add/remove the running binary from the per-user Login Items list — the
-// same list System Settings > General > Login Items shows and the "+" button
-// populates. This is the LSSharedFileList session list: deprecated since
-// 10.11 but still the only programmatic way to register a *bare binary*
-// (SMAppService requires a real .app bundle). The build passes
-// -Wno-deprecated-declarations so these calls compile clean.
+// We add/remove go_fish from the per-user Login Items list — the same list
+// System Settings > General > Login Items shows and the "+" button populates.
+// This is the LSSharedFileList session list: deprecated since 10.11 but still
+// a working programmatic path (SMAppService is the modern alternative). The
+// build passes -Wno-deprecated-declarations so these calls compile clean.
+//
+// We register the *.app bundle* rather than the inner Mach-O executable.
+// LaunchServices runs a .app directly at login, with no window. A bare Unix
+// binary, by contrast, has no LaunchServices opener, so macOS hosts it in
+// Terminal.app — that's the stray terminal window users saw before. When
+// go_fish is run loose (development, before `make app`), there is no bundle
+// to register and we fall back to the executable path so the toggle still
+// functions, terminal window and all.
 
 // Resolve the running binary's absolute path. _NSGetExecutablePath may
 // return a path with .. or symlinks; realpath flattens it so the login item
@@ -1805,8 +1812,26 @@ static NSString *gf_currentExecutablePath(void) {
     return [NSString stringWithUTF8String:buf];
 }
 
-static NSURL *gf_currentExecutableURL(void) {
-    NSString *p = gf_currentExecutablePath();
+// The path we actually register as a login item: the enclosing .app bundle
+// when we're running from one, otherwise the bare executable. Detected
+// structurally — an executable at <X>.app/Contents/MacOS/<exe> means the
+// bundle root is <X>.app.
+static NSString *gf_loginItemPath(void) {
+    NSString *exe = gf_currentExecutablePath();
+    if (exe.length == 0) return exe;
+    NSString *macosDir  = [exe stringByDeletingLastPathComponent];        // .../Contents/MacOS
+    NSString *contents  = [macosDir stringByDeletingLastPathComponent];   // .../Contents
+    NSString *appRoot   = [contents stringByDeletingLastPathComponent];   // .../<X>.app
+    if ([[macosDir lastPathComponent] isEqualToString:@"MacOS"] &&
+        [[contents lastPathComponent] isEqualToString:@"Contents"] &&
+        [[appRoot pathExtension] isEqualToString:@"app"]) {
+        return appRoot;
+    }
+    return exe;
+}
+
+static NSURL *gf_loginItemURL(void) {
+    NSString *p = gf_loginItemPath();
     if (p.length == 0) return nil;
     return [NSURL fileURLWithPath:p];
 }
@@ -1840,7 +1865,7 @@ static LSSharedFileListItemRef gf_copyLoginItemMatching(LSSharedFileListRef list
 }
 
 int gf_isLoginItemInstalled(void) {
-    NSString *path = gf_currentExecutablePath();
+    NSString *path = gf_loginItemPath();
     if (path.length == 0) return 0;
     LSSharedFileListRef list =
         LSSharedFileListCreate(NULL, kLSSharedFileListSessionLoginItems, NULL);
@@ -1853,9 +1878,9 @@ int gf_isLoginItemInstalled(void) {
 }
 
 int gf_installLoginItem(void) {
-    NSURL *url = gf_currentExecutableURL();
+    NSURL *url = gf_loginItemURL();
     if (!url) {
-        fprintf(stderr, "go_fish: could not determine executable path for login item\n");
+        fprintf(stderr, "go_fish: could not determine path for login item\n");
         return -1;
     }
     LSSharedFileListRef list =
@@ -1887,7 +1912,7 @@ int gf_installLoginItem(void) {
 }
 
 int gf_uninstallLoginItem(void) {
-    NSString *path = gf_currentExecutablePath();
+    NSString *path = gf_loginItemPath();
     if (path.length == 0) return -1;
     LSSharedFileListRef list =
         LSSharedFileListCreate(NULL, kLSSharedFileListSessionLoginItems, NULL);

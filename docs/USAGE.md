@@ -6,17 +6,16 @@ minimized ones, each addressable individually.
 
 ## First run
 
-After `./install.sh` puts the binary at `~/Applications/go_fish`,
-launch it:
+After `./build.sh` produces `./go_fish.app` in the repo root, launch it:
 
 ```sh
-open ~/Applications/go_fish
+open go_fish.app
 ```
 
-(Or double-click `go_fish` in Finder.) The installer does **not**
-register go_fish for startup — it runs as a normal foreground binary you
-start yourself. Auto-launch on login is opt-in via the **Start at boot**
-menu item once go_fish is up.
+(Or double-click `go_fish.app` in Finder.) `build.sh` does **not**
+register go_fish for startup — it runs as a menu-bar app you start
+yourself. Auto-launch on login is opt-in via the **Start at boot** menu
+item once go_fish is up.
 
 On the first launch, go_fish needs two permissions and will exit with a
 message after each. Grant them in **System Settings → Privacy & Security**:
@@ -58,10 +57,12 @@ go_fish is running. Click it to drop down a menu:
   AX position writes (fixed-UI Electron tools, full-screen apps that
   don't expose `AXFullScreen`, etc.) are skipped silently; the log file
   (`~/Library/Logs/go_fish.err.log`) records which.
-- **Start at boot** (toggle) — adds / removes the running binary in your
-  per-user **Login Items** (System Settings → General → Login Items).
+- **Start at boot** (toggle) — adds / removes the `go_fish.app` bundle in
+  your per-user **Login Items** (System Settings → General → Login Items).
   Effective on next login; the currently running instance is not
-  affected. See **Auto-launch on login** below for the contract details.
+  affected. Because a bundle is registered (not the bare binary), it
+  launches at login with **no Terminal window**. See **Auto-launch on
+  login** below for the contract details.
 - **Secure Event Input detection** (toggle) — when checked (default),
   go_fish polls `IsSecureEventInputEnabled()` every 1.5 s. While Secure
   Event Input is held by another app, the menu-bar icon gets a red X
@@ -201,34 +202,41 @@ go_fish runs as an accessory app (no Dock icon by default; only the
 menu-bar hook) and idles at effectively zero CPU until you press the
 hotkey.
 
-### Install
+### Build
 
 ```sh
-./install.sh              # install the prebuilt ./bin/go_fish into ~/Applications/
-./install.sh --build      # compile ./src → ./bin/go_fish first (needs Xcode CLT)
-./install.sh uninstall    # full teardown: stops process, removes the Login Items
-                          # entry + any legacy LaunchAgent, removes the binary,
-                          # optionally clears logs
+./build.sh                # compile ./src → ./go_fish.app (needs Xcode CLT)
+open go_fish.app          # launch it
 ```
 
-The installer **does not** register go_fish for startup. It just builds
-(optional, via `make`), ad-hoc signs, and copies the binary to
-`~/Applications/go_fish`. Launch it manually via `open
-~/Applications/go_fish` or by double-clicking in Finder.
+`build.sh` compiles the sources, generates the icon, assembles
+`./go_fish.app`, and ad-hoc signs it. It does **not** register go_fish for
+startup or move the bundle anywhere — launch it yourself with `open
+go_fish.app` (or double-click in Finder), and move the bundle wherever you
+like (e.g. `~/Applications`); it's self-contained. To uninstall, quit it
+and drag the `.app` to the Trash; remove the **Start at boot** entry first
+if you enabled it (uncheck it in the menu, or delete it under System
+Settings → General → Login Items).
 
 ### Auto-launch on login: Start at boot
 
-Open the menu-bar hook and check **Start at boot**. That adds the running
-binary's resolved path to your per-user **Login Items** (the list under
+Open the menu-bar hook and check **Start at boot**. That adds the
+`go_fish.app` bundle to your per-user **Login Items** (the list under
 **System Settings → General → Login Items**, the same one the "+" button
 populates), via the `LSSharedFileList` session list. Contract:
 
 - **No effect on the currently running instance.** The entry takes effect
   on your next login; the current process keeps running.
-- **Matched by resolved path.** The toggle reflects whether *this* binary
-  is registered. A stale entry pointing at a different location (e.g. an
-  old dev-build path) reads as not installed, so the checkmark tracks the
-  binary you're actually running.
+- **No Terminal window at login.** The login item points at the `.app`
+  bundle, which LaunchServices runs directly. (A bare Unix binary in
+  Login Items has no opener, so macOS hosts it in Terminal — the stray
+  window older builds showed. If you enabled Start at boot under one of
+  those builds, re-toggle it once after upgrading so the entry repoints
+  at the bundle.)
+- **Matched by resolved path.** The toggle reflects whether *this*
+  install is registered. A stale entry pointing at a different location
+  (e.g. an old dev-build path) reads as not installed, so the checkmark
+  tracks the app you're actually running.
 - **Unchecking** removes that entry from the list.
 - **Launches once at login.** Unlike the old LaunchAgent, a Login Item is
   not auto-restarted if it crashes. A permission-prompt guard still
@@ -249,8 +257,9 @@ osascript -e 'tell application "System Events" to delete (every login item whose
 ```
 
 > Earlier versions registered a LaunchAgent at
-> `~/Library/LaunchAgents/com.local.gofish.plist` instead. `./install.sh
-> uninstall` removes that legacy plist if it's still present.
+> `~/Library/LaunchAgents/com.local.gofish.plist` instead. If you ran one
+> of those, remove that legacy plist by hand:
+> `rm ~/Library/LaunchAgents/com.local.gofish.plist`.
 
 ## Resource footprint
 
@@ -283,10 +292,11 @@ Disable it (see "Disable the system Cmd+Tab" above).
   & Security → Accessibility). The toggle must be **on** for `go_fish`.
 - If you re-signed or rebuilt the binary, macOS may consider it a new app
   and silently revoke the permission until you re-grant it.
-- Check the binary's stderr. Launched from a terminal it prints there;
-  launched as a Login Item or via `open` it goes to the system log
-  (`log stream --predicate 'process == "go_fish"'`), or redirect it
-  yourself, e.g. `nohup ~/Applications/go_fish >~/Library/Logs/go_fish.err.log 2>&1 &`.
+- Check the binary's stderr. Launched as a Login Item or via `open` it
+  goes to the system log (`log stream --predicate 'process ==
+  "go_fish"'`). To capture it to a file, run the bundle's executable
+  directly from a terminal, e.g.
+  `~/Applications/go_fish.app/Contents/MacOS/go_fish >~/Library/Logs/go_fish.err.log 2>&1`.
 
 ### Cmd+Tab silently does nothing (system switcher also doesn't appear)
 
@@ -350,7 +360,7 @@ Mail, most Apple apps; not for every third-party.
 ### After granting permissions, it still complains
 
 Permissions are tied to the binary's signing identity. For an ad-hoc
-signed binary (what `install.sh` produces by default), that identity is
+signed binary (what `build.sh` produces by default), that identity is
 the **CDHash** — a hash of the binary's bytes. Every rebuild produces
 different bytes, so a fresh CDHash, so macOS treats it as a new app and
 re-prompts.
@@ -361,12 +371,12 @@ grant. The OS is waiting on permission for the current binary.
 
 **To fix once:** in **System Settings → Privacy & Security → Accessibility**,
 select the go_fish row and click the **−** button to remove it entirely.
-Do the same under **Screen Recording**. Re-run `./install.sh`. The next
-prompt will create a fresh entry that matches the running binary, and
-it'll stick until the next rebuild.
+Do the same under **Screen Recording**. Re-run `./build.sh` and relaunch.
+The next prompt will create a fresh entry that matches the running binary,
+and it'll stick until the next rebuild.
 
 **To stop the cycle:** stop using ad-hoc signing. Either
-(a) install once and don't rebuild, or
+(a) build once and don't rebuild, or
 (b) sign with a stable identity (Developer ID, or a self-signed code-
 signing cert you create in Keychain Access). See `BUILDING.md` →
 *Code signing* for both options.
