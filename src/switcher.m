@@ -154,7 +154,7 @@ int gfOnCommit(void) {
     gf_window_t chosen = gSwList[gSwSelected];
     gSwList[gSwSelected].axRef = NULL;
     tearDown();
-    gf_activateWindow(chosen.axRef, chosen.pid, chosen.minimized);
+    gf_activateWindow(chosen.axRef, chosen.pid, chosen.minimized, chosen.windowless);
     pthread_mutex_unlock(&gSwMu);
     return 1;
 }

@@ -53,8 +53,11 @@ void  gf_updateSelection(int selected);
 void  gf_hidePanel(void);
 
 // Activation. Brings window + app forward; if on another Space, the system
-// switches Spaces as a side-effect of activating the app.
-void gf_activateWindow(void *axRef, int pid, int minimized);
+// switches Spaces as a side-effect of activating the app. When windowless is 1
+// (a running app with no open windows), also sends the app a reopen Apple event
+// after activating — the same thing a Dock-icon click does — so it creates its
+// default window.
+void gf_activateWindow(void *axRef, int pid, int minimized, int windowless);
 
 // Close. Presses the target window's AX close button. Caller retains ownership
 // of axRef (this function does not release it).

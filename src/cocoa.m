@@ -1089,8 +1089,26 @@ void gf_hidePanel(void) {
 // Activation
 // =========================================================================
 
-void gf_activateWindow(void *axRefPtr, int pid, int minimized) {
-    // Unresponsive-app placeholder: no AX ref, just bring the app forward.
+// Sends the app at `pid` a reopen Apple event (kAEReopenApplication) — exactly
+// what a Dock-icon click delivers. An app with no open windows responds by
+// creating its default window; one that already has windows just comes forward.
+static void gf_sendReopen(pid_t pid) {
+    NSAppleEventDescriptor *target = [NSAppleEventDescriptor
+        descriptorWithDescriptorType:typeKernelProcessID
+                                bytes:&pid
+                               length:sizeof(pid)];
+    NSAppleEventDescriptor *event = [NSAppleEventDescriptor
+        appleEventWithEventClass:kCoreEventClass
+                         eventID:kAEReopenApplication
+                targetDescriptor:target
+                        returnID:kAutoGenerateReturnID
+                   transactionID:kAnyTransactionID];
+    [event sendEventWithOptions:NSAppleEventSendNoReply timeout:0 error:NULL];
+}
+
+void gf_activateWindow(void *axRefPtr, int pid, int minimized, int windowless) {
+    // No AX ref: an unresponsive-app or windowless placeholder. Bring the app
+    // forward, and for windowless apps also reopen so they surface a window.
     if (!axRefPtr) {
         if (pid <= 0) return;
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -1098,6 +1116,7 @@ void gf_activateWindow(void *axRefPtr, int pid, int minimized) {
                 NSRunningApplication *app = [NSRunningApplication
                     runningApplicationWithProcessIdentifier:(pid_t)pid];
                 [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+                if (windowless) gf_sendReopen((pid_t)pid);
             }
         });
         return;
