@@ -1089,7 +1089,15 @@ static void gf_scheduleThumbPurge(void) {
 
 void gf_showPanel(void *data, int selected) {
     gf_pd_t *d = (gf_pd_t *)data;
-    dispatch_async(dispatch_get_main_queue(), ^{
+    // 100 ms delay before showing the panel so the run loop has time to drain
+    // any pending HID events (modifier-up) before we commit to drawing the
+    // grid. This is the "quick-switch window": if the user releases the hotkey
+    // modifier within this period, gQuickSwitch is set to 1 and the block
+    // below bails out instead of showing the panel. Without the delay the
+    // dispatch queue can win the run loop race against the HID tap Mach port,
+    // causing the panel to flash briefly even on a quick tap.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
         // Quick-switch: hotkey released before panel opened. Skip the grid;
         // gfOnCommit is already queued and will activate the window.
         if (atomic_load(&gQuickSwitch)) {
