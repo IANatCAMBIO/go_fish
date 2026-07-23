@@ -80,6 +80,11 @@ static CFRunLoopSourceRef gEventTapSrc = NULL;
 // 0 = Cmd+Tab (default), 1 = Ctrl+Tab, 2 = Option+Tab
 static atomic_int gHotkeyModifier = 0;
 
+// Set to 1 when the hotkey modifier is released before the panel has opened
+// (i.e. gActive is still 0 at FlagsChanged time). gf_showPanel skips the grid
+// and lets the already-queued gfOnCommit activate the window silently.
+static atomic_int gQuickSwitch = 0;
+
 // Eager-push guard: when gf_activateWindow pushes a winID to the MRU front
 // before the OS activation completes, appActivated: may fire shortly after
 // and overwrite it with a stale AX focused-window result. We record the
@@ -191,11 +196,13 @@ static CGEventRef tapCallback(CGEventTapProxy proxy, CGEventType type,
             // ~100 ms of AX window enumeration; calling it synchronously here
             // causes kCGEventTapDisabledByTimeout at the HID level and the
             // event slips through to the system switcher before we can consume it.
+            atomic_store(&gQuickSwitch, 0); // reset — new key sequence starting
             int s = shift ? 1 : 0;
             dispatch_async(dispatch_get_main_queue(), ^{ gfOnHotkey(s, 0); });
             return NULL;
         }
         if (modDown && key == 0x32 /* ` (grave) */) {
+            atomic_store(&gQuickSwitch, 0);
             int s = shift ? 1 : 0;
             dispatch_async(dispatch_get_main_queue(), ^{ gfOnHotkey(s, 1); });
             return NULL;
@@ -205,10 +212,13 @@ static CGEventRef tapCallback(CGEventTapProxy proxy, CGEventType type,
             return NULL;
         }
     } else if (type == kCGEventFlagsChanged) {
-        // Always dispatch on modifier release — don't gate on gActive here.
-        // With async gfOnHotkey above, gActive may still be 0 when the modifier
-        // is released on a quick tap; gfOnCommit is a no-op when !gSwOpen.
         if (!modDown) {
+            // If the modifier is released before the panel has opened (gActive
+            // still 0), mark this as a quick switch. gf_showPanel will skip the
+            // grid; the gfOnCommit dispatched below activates the window silently.
+            if (!atomic_load(&gActive)) {
+                atomic_store(&gQuickSwitch, 1);
+            }
             dispatch_async(dispatch_get_main_queue(), ^{ gfOnCommit(); });
         }
     }
@@ -1051,6 +1061,13 @@ static void gf_scheduleThumbPurge(void) {
 void gf_showPanel(void *data, int selected) {
     gf_pd_t *d = (gf_pd_t *)data;
     dispatch_async(dispatch_get_main_queue(), ^{
+        // Quick-switch: hotkey released before panel opened. Skip the grid;
+        // gfOnCommit is already queued and will activate the window.
+        if (atomic_load(&gQuickSwitch)) {
+            atomic_store(&gQuickSwitch, 0);
+            freePanelData(d);
+            return;
+        }
         @autoreleasepool {
             ensurePanel();
             // Keep the cache alive while the panel is in use.
@@ -1080,8 +1097,24 @@ void gf_showPanel(void *data, int selected) {
             // Freeze the layout for this activation now that the frame (and
             // thus the view bounds) is final. Subsequent closes keep these
             // column/tile dimensions, so survivors stay pinned up-and-left.
-            gPanelView.baseLayout    = [gPanelView computeLayoutForCount:d->count];
+            gf_layout_t L = [gPanelView computeLayoutForCount:d->count];
+
+            // Resize the panel to exactly fit the computed tiles. When the
+            // preferred size is clamped to screen bounds the two constraints
+            // (width vs. height) rarely match: the tighter one drives tileW
+            // while the looser dimension has leftover whitespace. Computing
+            // the exact extent from tileW/cellH and re-setting the frame
+            // eliminates that gap. topY must track the new height.
+            NSInteger rows = ((NSInteger)d->count + L.cols - 1) / L.cols;
+            CGFloat exactW = 2*L.margin + L.cols*L.tileW + (L.cols-1)*L.gap;
+            CGFloat exactH = 2*L.margin + rows*L.cellH  + (rows-1)*L.gap;
+            L.topY = exactH - L.margin;
+            gPanelView.baseLayout    = L;
             gPanelView.hasBaseLayout = YES;
+            NSRect exactR = NSMakeRect(vf.origin.x + (vf.size.width  - exactW)/2,
+                                       vf.origin.y + (vf.size.height - exactH)/2,
+                                       exactW, exactH);
+            [gPanel setFrame:exactR display:NO];
 
             [gPanelView setNeedsDisplay:YES];
             [gPanel orderFrontRegardless];
