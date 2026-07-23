@@ -20,3 +20,4 @@ int  gfOnCommit(void);
 int  gfOnCancel(void);
 void gfSetSelection(int idx);
 int  gfOnClose(int idx);
+void gfOnFocus(int idx);

@@ -185,6 +185,18 @@ int gfOnCancel(void) {
     return 1;
 }
 
+void gfOnFocus(int idx) {
+    pthread_mutex_lock(&gSwMu);
+    if (!gSwOpen || idx < 0 || idx >= gSwCount) {
+        pthread_mutex_unlock(&gSwMu);
+        return;
+    }
+    int pid = gSwList[idx].pid;
+    tearDown();
+    gf_focusApp(pid);
+    pthread_mutex_unlock(&gSwMu);
+}
+
 int gfOnClose(int idx) {
     pthread_mutex_lock(&gSwMu);
     if (!gSwOpen) {

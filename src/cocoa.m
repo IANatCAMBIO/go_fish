@@ -80,6 +80,9 @@ static CFRunLoopSourceRef gEventTapSrc = NULL;
 // 0 = Cmd+Tab (default), 1 = Ctrl+Tab, 2 = Option+Tab
 static atomic_int gHotkeyModifier = 0;
 
+// 1 = show the focus (eyeball) button on each grid tile (default on).
+static atomic_int gShowFocusButton = 1;
+
 // Set to 1 when the hotkey modifier is released before the panel has opened
 // (i.e. gActive is still 0 at FlagsChanged time). gf_showPanel skips the grid
 // and lets the already-queued gfOnCommit activate the window silently.
@@ -330,7 +333,6 @@ static void gf_addWindowlessSlot(gf_slot_t *s, NSRunningApplication *app, pid_t 
 
 gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
     *out_count = 0;
-    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
     @autoreleasepool {
         // CGWindowID -> front-to-back-index map for sort + on-screen test.
         // Built once on the calling thread, then read concurrently from
@@ -557,9 +559,6 @@ gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
             return NULL;
         }
         *out_count = count;
-        fprintf(stderr, "go_fish: enumerate %lu apps -> %d windows in %.1f ms\n",
-                (unsigned long)napps, count,
-                (CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
         return out;
     }
 }
@@ -700,9 +699,19 @@ static NSSize gf_preferredPanelSize(NSInteger n) {
     NSRect r = [self imageRectForIndex:i layout:L];
     CGFloat d = MIN(16.0, L.appH - 4.0);
     if (d < 10.0) d = 10.0;
-    CGFloat bandY = NSMaxY(r) + 2;             // bottom of the app-name band
-    CGFloat y     = bandY + (L.appH - d) / 2;  // center vertically in the band
+    CGFloat bandY = NSMaxY(r) + 2;
+    CGFloat y     = bandY + (L.appH - d) / 2;
     return NSMakeRect(NSMinX(r), y, d, d);
+}
+
+// Focus-button rect for tile i — right side of the app-name band, mirroring close.
+- (NSRect)focusRectForIndex:(NSInteger)i layout:(gf_layout_t)L {
+    NSRect r = [self imageRectForIndex:i layout:L];
+    CGFloat d = MIN(16.0, L.appH - 4.0);
+    if (d < 10.0) d = 10.0;
+    CGFloat bandY = NSMaxY(r) + 2;
+    CGFloat y     = bandY + (L.appH - d) / 2;
+    return NSMakeRect(NSMaxX(r) - d, y, d, d);
 }
 
 - (NSInteger)indexAtPoint:(NSPoint)p layout:(gf_layout_t)L {
@@ -791,6 +800,9 @@ static void gf_initDrawAttrs(void) {
         NSRect closeR = [self closeRectForIndex:i layout:L];
         NSRect textR  = NSMakeRect(imgR.origin.x, imgR.origin.y - L.titleH - 2,
                                    imgR.size.width, L.titleH);
+        BOOL focusOn = atomic_load(&gShowFocusButton) != 0;
+        // Symmetric padding: close button left, focus button right (or just margin
+        // when hidden). Keeps the app name centered under the thumbnail in both states.
         CGFloat appPad = closeR.size.width + 4;
         CGFloat appW   = imgR.size.width - 2 * appPad;
         if (appW < 0) appW = 0;
@@ -840,9 +852,7 @@ static void gf_initDrawAttrs(void) {
             [e.appName drawInRect:appR withAttributes:gAppAttrs];
         }
 
-        // Close button: drawn for everything except unresponsive placeholders
-        // (which have no AX ref and can't be acted on). Windowless tiles get
-        // one too — closing them quits the app.
+        // Close button: drawn for everything except unresponsive placeholders.
         if (!e.unresponsive) {
             NSBezierPath *circle = [NSBezierPath bezierPathWithOvalInRect:closeR];
             [[NSColor colorWithWhite:0.0 alpha:0.60] setFill];
@@ -857,6 +867,20 @@ static void gf_initDrawAttrs(void) {
             [cross moveToPoint:NSMakePoint(NSMaxX(closeR) - pad, NSMinY(closeR) + pad)];
             [cross lineToPoint:NSMakePoint(NSMinX(closeR) + pad, NSMaxY(closeR) - pad)];
             [cross stroke];
+
+            // Focus button (⧉) — upper-right of the app-name band.
+            if (focusOn) {
+                NSRect focusR = [self focusRectForIndex:i layout:L];
+                [[NSBezierPath bezierPathWithOvalInRect:focusR] fill];  // reuse dark fill set above
+                NSDictionary *ga = @{
+                    NSFontAttributeName: [NSFont systemFontOfSize:focusR.size.width * 0.62],
+                    NSForegroundColorAttributeName: [NSColor colorWithWhite:1.0 alpha:0.95],
+                };
+                NSSize gs = [@"⧉" sizeWithAttributes:ga];
+                [@"⧉" drawAtPoint:NSMakePoint(NSMidX(focusR) - gs.width  / 2,
+                                               NSMidY(focusR) - gs.height / 2)
+                    withAttributes:ga];
+            }
         }
     }
 }
@@ -889,13 +913,18 @@ static void gf_initDrawAttrs(void) {
     NSInteger n = self.entries.count;
     if (n == 0) return;
     gf_layout_t L = [self layoutForCount:n];
-    // Close-button hit-test first, but only for entries that actually draw an
-    // X — unresponsive placeholders skip both the draw and the hit-test.
+    // Button hit-tests first (close and focus), before the tile-click fallthrough.
+    // Unresponsive placeholders skip both buttons.
     for (NSInteger i = 0; i < n; i++) {
         GFEntry *ge = self.entries[i];
         if (ge.unresponsive) continue;
         if (NSPointInRect(p, [self closeRectForIndex:i layout:L])) {
             gfOnClose((int)i);
+            return;
+        }
+        if (atomic_load(&gShowFocusButton) &&
+            NSPointInRect(p, [self focusRectForIndex:i layout:L])) {
+            gfOnFocus((int)i);
             return;
         }
     }
@@ -1331,7 +1360,12 @@ void gf_cascadeAll(void) {
             // AX uses a y-down coordinate space with origin at the primary
             // screen's top-left; AppKit uses y-up with origin at the primary
             // screen's bottom-left. Convert vf's top-left into AX space.
-            CGFloat primaryH = [[NSScreen screens] firstObject].frame.size.height;
+            // The AX-primary screen is the one whose AppKit origin is (0,0) —
+            // not necessarily firstObject, especially after a monitor change.
+            CGFloat primaryH = [NSScreen mainScreen].frame.size.height;
+            for (NSScreen *ps in [NSScreen screens])
+                if (ps.frame.origin.x == 0.0 && ps.frame.origin.y == 0.0)
+                    { primaryH = ps.frame.size.height; break; }
             CGFloat axStartX = vf.origin.x;
             CGFloat axStartY = primaryH - (vf.origin.y + vf.size.height);
 
@@ -1378,30 +1412,11 @@ void gf_cascadeAll(void) {
                     continue;
                 }
 
-                // Reversed order: back-most window (highest zOrder) lands at
-                // the top-left, each more-front window steps down-right. The
-                // post-loop raise pass below restores z-order so every
-                // window's title bar peeks out above the one in front of it.
-                int step = (n - 1 - i) % maxStep;
-                CGPoint pt = CGPointMake(axStartX + offset * step,
-                                         axStartY + offset * step);
-                AXValueRef ptVal = AXValueCreate(kAXValueCGPointType, &pt);
-                if (!ptVal) { skipped++; continue; }
-                AXError perr = AXUIElementSetAttributeValue(ax,
-                    kAXPositionAttribute, ptVal);
-                CFRelease(ptVal);
-                if (perr != kAXErrorSuccess) {
-                    fprintf(stderr,
-                        "go_fish cascade: failed to move \"%s\" (%s) — AXError=%d\n",
-                        w[i].title ?: "", w[i].appName ?: "", (int)perr);
-                    skipped++;
-                    continue;
-                }
-                moved++;
-
-                // Resize is best-effort and independent of the move. Some
-                // apps (Calculator, Maps, fixed-UI Electron tools) refuse
-                // size writes; the cascade position still lands either way.
+                // Resize BEFORE repositioning. A window that is oversized
+                // (e.g. was maximised on a larger external monitor) causes
+                // macOS to clamp the subsequent position set — keeping the
+                // window on-screen at its large size — so step 0 never lands
+                // at (axStartX, axStartY). Shrinking first avoids that clamp.
                 Boolean szSettable = false;
                 AXError szerr = AXUIElementIsAttributeSettable(ax,
                     kAXSizeAttribute, &szSettable);
@@ -1426,6 +1441,27 @@ void gf_cascadeAll(void) {
                         w[i].title ?: "", w[i].appName ?: "",
                         (int)szerr, (int)szSettable);
                 }
+
+                // Reversed order: back-most window (highest zOrder) lands at
+                // the top-left, each more-front window steps down-right. The
+                // post-loop raise pass below restores z-order so every
+                // window's title bar peeks out above the one in front of it.
+                int step = (n - 1 - i) % maxStep;
+                CGPoint pt = CGPointMake(axStartX + offset * step,
+                                         axStartY + offset * step);
+                AXValueRef ptVal = AXValueCreate(kAXValueCGPointType, &pt);
+                if (!ptVal) { skipped++; continue; }
+                AXError perr = AXUIElementSetAttributeValue(ax,
+                    kAXPositionAttribute, ptVal);
+                CFRelease(ptVal);
+                if (perr != kAXErrorSuccess) {
+                    fprintf(stderr,
+                        "go_fish cascade: failed to move \"%s\" (%s) — AXError=%d\n",
+                        w[i].title ?: "", w[i].appName ?: "", (int)perr);
+                    skipped++;
+                    continue;
+                }
+                moved++;
             }
             fprintf(stderr,
                     "go_fish cascade: moved %d, resized %d, skipped %d of %d (target %.0fx%.0f)\n",
@@ -1495,6 +1531,88 @@ void gf_cascadeAll(void) {
                 if (w[i].axRef) gf_release(w[i].axRef);
             }
             free(w);
+        }
+    });
+}
+
+// Minimize all windows except pid's, then cascade pid's windows and activate
+// the app. Called from gfOnFocus when the user clicks the eyeball in the grid.
+void gf_focusApp(int pid) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            int n = 0;
+            gf_window_t *all = gf_enumerateWindows(&n, 0);
+
+            // Screen + cascade parameters (matches gf_cascadeAll).
+            NSPoint cursor = [NSEvent mouseLocation];
+            NSScreen *screen = [NSScreen mainScreen];
+            for (NSScreen *s in [NSScreen screens])
+                if (NSPointInRect(cursor, s.frame)) { screen = s; break; }
+            NSRect vf = screen.visibleFrame;
+            CGFloat primaryH = [NSScreen mainScreen].frame.size.height;
+            for (NSScreen *ps in [NSScreen screens])
+                if (ps.frame.origin.x == 0.0 && ps.frame.origin.y == 0.0)
+                    { primaryH = ps.frame.size.height; break; }
+            CGFloat axStartX = vf.origin.x;
+            CGFloat axStartY = primaryH - (vf.origin.y + vf.size.height);
+            CGFloat offset  = 32.0;
+            CGFloat budget  = MAX(vf.size.height - 300.0, offset * 2);
+            int     maxStep = MAX(1, (int)(budget / offset));
+            CGFloat targetW = MIN(MAX(vf.size.width  * 0.75, 480.0), 1600.0);
+            CGFloat targetH = MIN(MAX(vf.size.height * 0.75, 320.0), 1000.0);
+
+            if (all) {
+                qsort(all, n, sizeof(gf_window_t), gf_cmpZOrder); // front-to-back
+
+                // Minimize every window NOT belonging to pid.
+                for (int i = 0; i < n; i++) {
+                    if (all[i].pid == pid || all[i].minimized || !all[i].axRef) continue;
+                    AXUIElementSetAttributeValue((AXUIElementRef)all[i].axRef,
+                        kAXMinimizedAttribute, kCFBooleanTrue);
+                }
+
+                // Cascade pid's windows back-to-front so the frontmost window
+                // (i==0) lands at the deepest step and remains visually on top.
+                int step = 0;
+                for (int i = n - 1; i >= 0; i--) {
+                    if (all[i].pid != pid || !all[i].axRef) continue;
+                    AXUIElementRef ax = (AXUIElementRef)all[i].axRef;
+
+                    if (all[i].minimized)
+                        AXUIElementSetAttributeValue(ax, kAXMinimizedAttribute, kCFBooleanFalse);
+                    if (gf_isFullScreen(ax))
+                        AXUIElementSetAttributeValue(ax, CFSTR("AXFullScreen"), kCFBooleanFalse);
+
+                    // Resize before repositioning (same reason as gf_cascadeAll:
+                    // avoids macOS clamping the position of an oversized window).
+                    Boolean szSettable = false;
+                    if (AXUIElementIsAttributeSettable(ax, kAXSizeAttribute, &szSettable) == kAXErrorSuccess && szSettable) {
+                        CGSize sz = CGSizeMake(targetW, targetH);
+                        AXValueRef sv = AXValueCreate(kAXValueCGSizeType, &sz);
+                        if (sv) { AXUIElementSetAttributeValue(ax, kAXSizeAttribute, sv); CFRelease(sv); }
+                    }
+                    Boolean settable = false;
+                    if (AXUIElementIsAttributeSettable(ax, kAXPositionAttribute, &settable) == kAXErrorSuccess && settable) {
+                        int s = step % maxStep;
+                        CGPoint pt = CGPointMake(axStartX + offset * s, axStartY + offset * s);
+                        AXValueRef pv = AXValueCreate(kAXValueCGPointType, &pt);
+                        if (pv) { AXUIElementSetAttributeValue(ax, kAXPositionAttribute, pv); CFRelease(pv); }
+                    }
+                    step++;
+                }
+
+                for (int i = 0; i < n; i++) {
+                    free(all[i].title);
+                    free(all[i].appName);
+                    if (all[i].axRef) gf_release(all[i].axRef);
+                }
+                free(all);
+            }
+
+            // Activate the app regardless of whether enumeration succeeded.
+            NSRunningApplication *app = [NSRunningApplication
+                runningApplicationWithProcessIdentifier:(pid_t)pid];
+            [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
         }
     });
 }
@@ -1824,12 +1942,14 @@ static void gf_setupMRUTracking(void) {
 @property (nonatomic, weak) NSMenuItem *seiItem;
 @property (nonatomic, weak) NSMenuItem *bootItem;
 @property (nonatomic, weak) NSMenuItem *windowlessItem;
+@property (nonatomic, weak) NSMenuItem *focusButtonItem;
 @property (nonatomic, strong) NSArray<NSMenuItem *> *hotkeyItems;
 - (void)showGrid:(id)sender;
 - (void)minimizeAll:(id)sender;
 - (void)cascadeAll:(id)sender;
 - (void)toggleSEIDetection:(id)sender;
 - (void)toggleWindowlessApps:(id)sender;
+- (void)toggleFocusButton:(id)sender;
 - (void)toggleStartAtBoot:(id)sender;
 - (void)changeHotkey:(NSMenuItem *)sender;
 - (void)quit:(id)sender;
@@ -1854,6 +1974,13 @@ static void gf_applySEIState(BOOL active);
     [[NSUserDefaults standardUserDefaults] setBool:(next ? YES : NO)
                                             forKey:@"ShowWindowlessApps"];
     self.windowlessItem.state = next ? NSControlStateValueOn : NSControlStateValueOff;
+}
+- (void)toggleFocusButton:(id)sender {
+    int next = atomic_load(&gShowFocusButton) ? 0 : 1;
+    atomic_store(&gShowFocusButton, next);
+    [[NSUserDefaults standardUserDefaults] setBool:(next ? YES : NO)
+                                            forKey:@"ShowFocusButton"];
+    self.focusButtonItem.state = next ? NSControlStateValueOn : NSControlStateValueOff;
 }
 - (void)toggleSEIDetection:(id)sender {
     int next = atomic_load(&gSEIDetection) ? 0 : 1;
@@ -2190,11 +2317,11 @@ static void gf_startSEITimer(void) {
     // activation triggers get near-instant feedback via the explicit
     // re-poll in GFMRUTracker.appActivated:. IsSecureEventInputEnabled
     // is a sub-millisecond syscall, so 2 Hz polling is free.
-    gSEITimer = [NSTimer scheduledTimerWithTimeInterval:0.5
-                                                 repeats:YES
-                                                   block:^(NSTimer *_t) { gf_pollSEI(); }];
-    // Run during menu tracking too, so the X appears/disappears while the
-    // user has the menu open.
+    // NSRunLoopCommonModes covers NSDefaultRunLoopMode + NSEventTrackingRunLoopMode
+    // so the X appears/disappears while the user has the menu open.
+    gSEITimer = [NSTimer timerWithTimeInterval:0.5
+                                       repeats:YES
+                                         block:^(NSTimer *_t) { gf_pollSEI(); }];
     [[NSRunLoop currentRunLoop] addTimer:gSEITimer forMode:NSRunLoopCommonModes];
     // Fire once immediately so initial state is accurate.
     gf_pollSEI();
@@ -2220,10 +2347,13 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     [defaults registerDefaults:@{@"SEIDetection": @YES,
                                  @"ShowWindowlessApps": @NO,
+                                 @"ShowFocusButton": @YES,
                                  @"HotkeyModifier": @0}];
     atomic_store(&gSEIDetection, [defaults boolForKey:@"SEIDetection"] ? 1 : 0);
     atomic_store(&gShowWindowlessApps,
                  [defaults boolForKey:@"ShowWindowlessApps"] ? 1 : 0);
+    atomic_store(&gShowFocusButton,
+                 [defaults boolForKey:@"ShowFocusButton"] ? 1 : 0);
     atomic_store(&gHotkeyModifier, (int)[defaults integerForKey:@"HotkeyModifier"]);
 
     NSMenu *menu = [[NSMenu alloc] init];
@@ -2249,6 +2379,9 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
 
     [menu addItem:[NSMenuItem separatorItem]];
 
+    // --- Configuration submenu ---
+    NSMenu *configMenu = [[NSMenu alloc] init];
+
     NSMenuItem *bootItem = [[NSMenuItem alloc] initWithTitle:@"Start at boot"
                                                       action:@selector(toggleStartAtBoot:)
                                                keyEquivalent:@""];
@@ -2256,7 +2389,9 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
     bootItem.state  = gf_isLoginItemInstalled()
         ? NSControlStateValueOn : NSControlStateValueOff;
     gStatusHandler.bootItem = bootItem;
-    [menu addItem:bootItem];
+    [configMenu addItem:bootItem];
+
+    [configMenu addItem:[NSMenuItem separatorItem]];
 
     NSMenuItem *seiItem = [[NSMenuItem alloc] initWithTitle:@"Secure Event Input detection"
                                                      action:@selector(toggleSEIDetection:)
@@ -2265,7 +2400,7 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
     seiItem.state  = atomic_load(&gSEIDetection)
         ? NSControlStateValueOn : NSControlStateValueOff;
     gStatusHandler.seiItem = seiItem;
-    [menu addItem:seiItem];
+    [configMenu addItem:seiItem];
 
     NSMenuItem *windowlessItem =
         [[NSMenuItem alloc] initWithTitle:@"Show apps without windows"
@@ -2275,11 +2410,20 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
     windowlessItem.state  = atomic_load(&gShowWindowlessApps)
         ? NSControlStateValueOn : NSControlStateValueOff;
     gStatusHandler.windowlessItem = windowlessItem;
-    [menu addItem:windowlessItem];
+    [configMenu addItem:windowlessItem];
 
-    // Hotkey modifier submenu — lets the user pick an alternative trigger
-    // when macOS intercepts Cmd+Tab (e.g. Secure Event Input, or the system
-    // switcher being re-enabled in System Settings).
+    NSMenuItem *focusButtonItem =
+        [[NSMenuItem alloc] initWithTitle:@"Show focus button in grid"
+                                   action:@selector(toggleFocusButton:)
+                            keyEquivalent:@""];
+    focusButtonItem.target = gStatusHandler;
+    focusButtonItem.state  = atomic_load(&gShowFocusButton)
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    gStatusHandler.focusButtonItem = focusButtonItem;
+    [configMenu addItem:focusButtonItem];
+
+    [configMenu addItem:[NSMenuItem separatorItem]];
+
     int currentMod = atomic_load(&gHotkeyModifier);
     NSMenu *hotkeyMenu = [[NSMenu alloc] init];
     NSArray<NSString *> *hotkeyLabels = @[@"Cmd+Tab (default)", @"Ctrl+Tab", @"Option+Tab"];
@@ -2299,7 +2443,13 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
                                                           action:nil
                                                    keyEquivalent:@""];
     hotkeyParent.submenu = hotkeyMenu;
-    [menu addItem:hotkeyParent];
+    [configMenu addItem:hotkeyParent];
+
+    NSMenuItem *configParent = [[NSMenuItem alloc] initWithTitle:@"Configuration"
+                                                          action:nil
+                                                   keyEquivalent:@""];
+    configParent.submenu = configMenu;
+    [menu addItem:configParent];
 
     [menu addItem:[NSMenuItem separatorItem]];
 

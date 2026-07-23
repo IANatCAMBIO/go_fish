@@ -67,6 +67,10 @@ void gf_closeWindow(void *axRef);
 // app placeholders, which have no window to close.
 void gf_quitApp(int pid);
 
+// Focus app. Minimizes every window not belonging to pid, then unminimizes and
+// cascades all of pid's windows. Used by the grid eyeball button.
+void gf_focusApp(int pid);
+
 // Bulk window arrangement, driven by the menu-bar status item.
 // Both operate on every standard window of every regular app (same filter
 // gf_enumerateWindows uses).
