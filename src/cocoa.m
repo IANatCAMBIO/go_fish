@@ -77,6 +77,18 @@ static atomic_int        gActive = 0;          // 1 when panel is up.
 static CFMachPortRef     gEventTap = NULL;
 static CFRunLoopSourceRef gEventTapSrc = NULL;
 
+// 0 = Cmd+Tab (default), 1 = Ctrl+Tab, 2 = Option+Tab
+static atomic_int gHotkeyModifier = 0;
+
+// Eager-push guard: when gf_activateWindow pushes a winID to the MRU front
+// before the OS activation completes, appActivated: may fire shortly after
+// and overwrite it with a stale AX focused-window result. We record the
+// pushed winID and timestamp here; appActivated: skips its push if the AX
+// query returns a *different* window within the suppression window.
+static CGWindowID     gLastEagerPushWinID  = 0;
+static CFAbsoluteTime gLastEagerPushTime   = 0;
+static const CFAbsoluteTime kEagerPushSuppressWindow = 0.5;
+
 @class GFPanelView;
 static NSPanel     *gPanel = nil;
 static GFPanelView *gPanelView = nil;
@@ -152,31 +164,52 @@ void gf_promptScreenRecording(void) {
 static CGEventRef tapCallback(CGEventTapProxy proxy, CGEventType type,
                               CGEventRef event, void *refcon) {
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        fprintf(stderr,
+            "go_fish: event tap disabled by macOS (type=%u). "
+            "Shortcuts won't fire until Accessibility permission is re-granted.\n"
+            "  Fix: System Settings > Privacy & Security > Accessibility\n"
+            "       Remove go_fish, re-add it, then quit and reopen go_fish.\n",
+            type);
         if (gEventTap) CGEventTapEnable(gEventTap, true);
         return event;
     }
 
     CGEventFlags flags = CGEventGetFlags(event);
-    BOOL cmd   = (flags & kCGEventFlagMaskCommand) != 0;
-    BOOL shift = (flags & kCGEventFlagMaskShift)   != 0;
+    CGEventFlags modMask;
+    switch (atomic_load(&gHotkeyModifier)) {
+        case 1:  modMask = kCGEventFlagMaskControl;   break;
+        case 2:  modMask = kCGEventFlagMaskAlternate; break;
+        default: modMask = kCGEventFlagMaskCommand;   break;
+    }
+    BOOL modDown = (flags & modMask) != 0;
+    BOOL shift   = (flags & kCGEventFlagMaskShift) != 0;
 
     if (type == kCGEventKeyDown) {
         CGKeyCode key = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
-        if (cmd && key == 0x30 /* Tab */) {
-            if (gfOnHotkey(shift ? 1 : 0, 0)) return NULL;
-            return event;
+        if (modDown && key == 0x30 /* Tab */) {
+            // Dispatch so the tap callback returns in < 1 µs. gfOnHotkey does
+            // ~100 ms of AX window enumeration; calling it synchronously here
+            // causes kCGEventTapDisabledByTimeout at the HID level and the
+            // event slips through to the system switcher before we can consume it.
+            int s = shift ? 1 : 0;
+            dispatch_async(dispatch_get_main_queue(), ^{ gfOnHotkey(s, 0); });
+            return NULL;
         }
-        if (cmd && key == 0x32 /* ` (grave) */) {
-            if (gfOnHotkey(shift ? 1 : 0, 1)) return NULL;
-            return event;
+        if (modDown && key == 0x32 /* ` (grave) */) {
+            int s = shift ? 1 : 0;
+            dispatch_async(dispatch_get_main_queue(), ^{ gfOnHotkey(s, 1); });
+            return NULL;
         }
         if (key == 0x35 /* Escape */ && atomic_load(&gActive)) {
-            gfOnCancel();
+            dispatch_async(dispatch_get_main_queue(), ^{ gfOnCancel(); });
             return NULL;
         }
     } else if (type == kCGEventFlagsChanged) {
-        if (!cmd && atomic_load(&gActive)) {
-            gfOnCommit();
+        // Always dispatch on modifier release — don't gate on gActive here.
+        // With async gfOnHotkey above, gActive may still be 0 when the modifier
+        // is released on a quick tap; gfOnCommit is a no-op when !gSwOpen.
+        if (!modDown) {
+            dispatch_async(dispatch_get_main_queue(), ^{ gfOnCommit(); });
         }
     }
     return event;
@@ -184,12 +217,28 @@ static CGEventRef tapCallback(CGEventTapProxy proxy, CGEventType type,
 
 static void installEventTap(void) {
     CGEventMask mask = CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventFlagsChanged);
-    gEventTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
+    // Prefer HID-level tap: it fires before the macOS system Cmd+Tab handler,
+    // so we can intercept Cmd+Tab regardless of whether the system shortcut is
+    // enabled in System Settings. Requires the same Accessibility permission
+    // as the session-level tap; falls back to session-level if unavailable.
+    gEventTap = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap,
                                  kCGEventTapOptionDefault, mask, tapCallback, NULL);
     if (!gEventTap) {
-        fprintf(stderr, "go_fish: failed to create event tap (Accessibility permission?)\n");
+        fprintf(stderr,
+            "go_fish: HID event tap unavailable, falling back to session-level tap.\n"
+            "  Cmd+Tab may be intercepted by the macOS switcher; if so, pick an\n"
+            "  alternative hotkey via the go_fish menu bar icon → Switch hotkey.\n");
+        gEventTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
+                                     kCGEventTapOptionDefault, mask, tapCallback, NULL);
+    }
+    if (!gEventTap) {
+        fprintf(stderr,
+            "go_fish: FAILED to create event tap — keyboard shortcuts will not work.\n"
+            "  Fix: System Settings > Privacy & Security > Accessibility\n"
+            "       Remove go_fish from the list, re-add it, then relaunch.\n");
         return;
     }
+    fprintf(stderr, "go_fish: event tap installed OK.\n");
     gEventTapSrc = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, gEventTap, 0);
     CFRunLoopAddSource(CFRunLoopGetCurrent(), gEventTapSrc, kCFRunLoopCommonModes);
     CGEventTapEnable(gEventTap, true);
@@ -1129,10 +1178,13 @@ void gf_activateWindow(void *axRefPtr, int pid, int minimized, int windowless) {
             // of the already-frontmost app fires no NSWorkspace notification,
             // and the AX kAXFocusedWindowChangedNotification arrives async
             // (sometimes after the user's next hotkey press). Doing it
-            // eagerly makes quick Cmd+` toggling behave correctly.
+            // eagerly makes quick toggle behave correctly.
+            // Record the push so appActivated: can detect stale AX queries.
             CGWindowID winID = 0;
             _AXUIElementGetWindow(w, &winID);
             if (winID != 0) {
+                gLastEagerPushWinID = winID;
+                gLastEagerPushTime  = CFAbsoluteTimeGetCurrent();
                 gf_pushMRU(winID);
                 gf_captureAsync(winID);
             }
@@ -1650,7 +1702,19 @@ static void gf_pollSEI(void);
     pid_t pid = app.processIdentifier;
     CGWindowID winID = gf_focusedWindowForPID(pid);
     if (winID != 0) {
-        gf_pushMRU(winID);
+        // Guard against stale AX focused-window data. When the switcher just
+        // activated a window via gf_activateWindow, we eagerly pushed that
+        // winID to the MRU front. The NSWorkspace notification fires shortly
+        // after, but gf_focusedWindowForPID may still return the *old*
+        // focused window if the app hasn't processed our AX attributes yet.
+        // If we're within the suppression window and AX returned a *different*
+        // window than what we pushed, trust our eager push over the stale query.
+        BOOL withinSuppress =
+            gLastEagerPushWinID != 0 &&
+            (CFAbsoluteTimeGetCurrent() - gLastEagerPushTime) < kEagerPushSuppressWindow;
+        if (!withinSuppress || winID == gLastEagerPushWinID) {
+            gf_pushMRU(winID);
+        }
         gf_captureAsync(winID);
     }
     gf_installObserverForPID(pid); // in case it's a freshly-regular app
@@ -1727,12 +1791,14 @@ static void gf_setupMRUTracking(void) {
 @property (nonatomic, weak) NSMenuItem *seiItem;
 @property (nonatomic, weak) NSMenuItem *bootItem;
 @property (nonatomic, weak) NSMenuItem *windowlessItem;
+@property (nonatomic, strong) NSArray<NSMenuItem *> *hotkeyItems;
 - (void)showGrid:(id)sender;
 - (void)minimizeAll:(id)sender;
 - (void)cascadeAll:(id)sender;
 - (void)toggleSEIDetection:(id)sender;
 - (void)toggleWindowlessApps:(id)sender;
 - (void)toggleStartAtBoot:(id)sender;
+- (void)changeHotkey:(NSMenuItem *)sender;
 - (void)quit:(id)sender;
 @end
 
@@ -1792,6 +1858,14 @@ static void gf_applySEIState(BOOL active);
             ? @"go_fish will launch automatically on your next login. (No change to the currently-running instance.)"
             : @"go_fish will not auto-launch on next login. The current instance keeps running until you quit it.";
         [alert runModal];
+    }
+}
+- (void)changeHotkey:(NSMenuItem *)sender {
+    int choice = (int)sender.tag;
+    atomic_store(&gHotkeyModifier, choice);
+    [[NSUserDefaults standardUserDefaults] setInteger:choice forKey:@"HotkeyModifier"];
+    for (NSMenuItem *item in self.hotkeyItems) {
+        item.state = (item.tag == choice) ? NSControlStateValueOn : NSControlStateValueOff;
     }
 }
 - (void)quit:(id)sender {
@@ -2109,13 +2183,15 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
     gStatusItem.button.image   = icon;
     gStatusItem.button.toolTip = @"go_fish";
 
-    // Restore the user's preference (default: enabled).
+    // Restore the user's preferences.
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     [defaults registerDefaults:@{@"SEIDetection": @YES,
-                                 @"ShowWindowlessApps": @NO}];
+                                 @"ShowWindowlessApps": @NO,
+                                 @"HotkeyModifier": @0}];
     atomic_store(&gSEIDetection, [defaults boolForKey:@"SEIDetection"] ? 1 : 0);
     atomic_store(&gShowWindowlessApps,
                  [defaults boolForKey:@"ShowWindowlessApps"] ? 1 : 0);
+    atomic_store(&gHotkeyModifier, (int)[defaults integerForKey:@"HotkeyModifier"]);
 
     NSMenu *menu = [[NSMenu alloc] init];
     NSMenuItem *showItem = [[NSMenuItem alloc] initWithTitle:@"Show Window Grid"
@@ -2167,6 +2243,30 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
         ? NSControlStateValueOn : NSControlStateValueOff;
     gStatusHandler.windowlessItem = windowlessItem;
     [menu addItem:windowlessItem];
+
+    // Hotkey modifier submenu — lets the user pick an alternative trigger
+    // when macOS intercepts Cmd+Tab (e.g. Secure Event Input, or the system
+    // switcher being re-enabled in System Settings).
+    int currentMod = atomic_load(&gHotkeyModifier);
+    NSMenu *hotkeyMenu = [[NSMenu alloc] init];
+    NSArray<NSString *> *hotkeyLabels = @[@"Cmd+Tab (default)", @"Ctrl+Tab", @"Option+Tab"];
+    NSMutableArray<NSMenuItem *> *hotkeyItems = [NSMutableArray arrayWithCapacity:3];
+    for (NSInteger i = 0; i < (NSInteger)hotkeyLabels.count; i++) {
+        NSMenuItem *hi = [[NSMenuItem alloc] initWithTitle:hotkeyLabels[i]
+                                                    action:@selector(changeHotkey:)
+                                             keyEquivalent:@""];
+        hi.target = gStatusHandler;
+        hi.tag    = i;
+        hi.state  = (i == currentMod) ? NSControlStateValueOn : NSControlStateValueOff;
+        [hotkeyMenu addItem:hi];
+        [hotkeyItems addObject:hi];
+    }
+    gStatusHandler.hotkeyItems = hotkeyItems;
+    NSMenuItem *hotkeyParent = [[NSMenuItem alloc] initWithTitle:@"Switch hotkey"
+                                                          action:nil
+                                                   keyEquivalent:@""];
+    hotkeyParent.submenu = hotkeyMenu;
+    [menu addItem:hotkeyParent];
 
     [menu addItem:[NSMenuItem separatorItem]];
 

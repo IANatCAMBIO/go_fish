@@ -81,8 +81,6 @@ int main(int argc, const char *argv[]) {
         writeAttempts(0);
 
         fprintf(stderr, "go_fish running. Press Cmd+Tab to switch windows, or click the hook in the menu bar.\n");
-        fprintf(stderr, "If the system switcher opens instead of go_fish, disable Cmd+Tab in\n");
-        fprintf(stderr, "System Settings > Keyboard > Keyboard Shortcuts > Mission Control.\n");
         gf_run(hook_png, (int)hook_png_len); // blocks; NSApplication.run
     }
     return 0;
