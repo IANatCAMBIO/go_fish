@@ -80,6 +80,9 @@ static CFRunLoopSourceRef gEventTapSrc = NULL;
 // 0 = Cmd+Tab (default), 1 = Ctrl+Tab, 2 = Option+Tab
 static atomic_int gHotkeyModifier = 0;
 
+// Quick-switch delay in milliseconds: 75, 100 (default), or 150.
+static atomic_int gQuickSwitchDelayMs = 100;
+
 // 1 = show the focus (eyeball) button on each grid tile (default on).
 static atomic_int gShowFocusButton = 1;
 
@@ -1096,7 +1099,8 @@ void gf_showPanel(void *data, int selected) {
     // below bails out instead of showing the panel. Without the delay the
     // dispatch queue can win the run loop race against the HID tap Mach port,
     // causing the panel to flash briefly even on a quick tap.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                (int64_t)atomic_load(&gQuickSwitchDelayMs) * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{
         // Quick-switch: hotkey released before panel opened. Skip the grid;
         // gfOnCommit is already queued and will activate the window.
@@ -1952,6 +1956,7 @@ static void gf_setupMRUTracking(void) {
 @property (nonatomic, weak) NSMenuItem *windowlessItem;
 @property (nonatomic, weak) NSMenuItem *focusButtonItem;
 @property (nonatomic, strong) NSArray<NSMenuItem *> *hotkeyItems;
+@property (nonatomic, strong) NSArray<NSMenuItem *> *quickDelayItems;
 - (void)showGrid:(id)sender;
 - (void)minimizeAll:(id)sender;
 - (void)cascadeAll:(id)sender;
@@ -1960,6 +1965,7 @@ static void gf_setupMRUTracking(void) {
 - (void)toggleFocusButton:(id)sender;
 - (void)toggleStartAtBoot:(id)sender;
 - (void)changeHotkey:(NSMenuItem *)sender;
+- (void)changeQuickDelay:(NSMenuItem *)sender;
 - (void)quit:(id)sender;
 @end
 
@@ -2034,6 +2040,14 @@ static void gf_applySEIState(BOOL active);
     [[NSUserDefaults standardUserDefaults] setInteger:choice forKey:@"HotkeyModifier"];
     for (NSMenuItem *item in self.hotkeyItems) {
         item.state = (item.tag == choice) ? NSControlStateValueOn : NSControlStateValueOff;
+    }
+}
+- (void)changeQuickDelay:(NSMenuItem *)sender {
+    int ms = (int)sender.tag;
+    atomic_store(&gQuickSwitchDelayMs, ms);
+    [[NSUserDefaults standardUserDefaults] setInteger:ms forKey:@"QuickSwitchDelayMs"];
+    for (NSMenuItem *item in self.quickDelayItems) {
+        item.state = (item.tag == ms) ? NSControlStateValueOn : NSControlStateValueOff;
     }
 }
 - (void)quit:(id)sender {
@@ -2356,13 +2370,15 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
     [defaults registerDefaults:@{@"SEIDetection": @YES,
                                  @"ShowWindowlessApps": @NO,
                                  @"ShowFocusButton": @YES,
-                                 @"HotkeyModifier": @0}];
+                                 @"HotkeyModifier": @0,
+                                 @"QuickSwitchDelayMs": @100}];
     atomic_store(&gSEIDetection, [defaults boolForKey:@"SEIDetection"] ? 1 : 0);
     atomic_store(&gShowWindowlessApps,
                  [defaults boolForKey:@"ShowWindowlessApps"] ? 1 : 0);
     atomic_store(&gShowFocusButton,
                  [defaults boolForKey:@"ShowFocusButton"] ? 1 : 0);
     atomic_store(&gHotkeyModifier, (int)[defaults integerForKey:@"HotkeyModifier"]);
+    atomic_store(&gQuickSwitchDelayMs, (int)[defaults integerForKey:@"QuickSwitchDelayMs"]);
 
     NSMenu *menu = [[NSMenu alloc] init];
     NSMenuItem *showItem = [[NSMenuItem alloc] initWithTitle:@"Show Window Grid"
@@ -2452,6 +2468,29 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
                                                    keyEquivalent:@""];
     hotkeyParent.submenu = hotkeyMenu;
     [configMenu addItem:hotkeyParent];
+
+    int currentDelay = atomic_load(&gQuickSwitchDelayMs);
+    NSMenu *delayMenu = [[NSMenu alloc] init];
+    NSArray<NSNumber *> *delayValues = @[@75, @100, @150];
+    NSArray<NSString *> *delayLabels = @[@"75 ms", @"100 ms (default)", @"150 ms"];
+    NSMutableArray<NSMenuItem *> *delayItems = [NSMutableArray arrayWithCapacity:3];
+    for (NSInteger i = 0; i < (NSInteger)delayValues.count; i++) {
+        int ms = delayValues[i].intValue;
+        NSMenuItem *di = [[NSMenuItem alloc] initWithTitle:delayLabels[i]
+                                                    action:@selector(changeQuickDelay:)
+                                             keyEquivalent:@""];
+        di.target = gStatusHandler;
+        di.tag    = ms;
+        di.state  = (ms == currentDelay) ? NSControlStateValueOn : NSControlStateValueOff;
+        [delayMenu addItem:di];
+        [delayItems addObject:di];
+    }
+    gStatusHandler.quickDelayItems = delayItems;
+    NSMenuItem *delayParent = [[NSMenuItem alloc] initWithTitle:@"Quick Switch Delay"
+                                                         action:nil
+                                                  keyEquivalent:@""];
+    delayParent.submenu = delayMenu;
+    [configMenu addItem:delayParent];
 
     NSMenuItem *configParent = [[NSMenuItem alloc] initWithTitle:@"Configuration"
                                                           action:nil
