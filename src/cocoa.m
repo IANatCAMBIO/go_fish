@@ -30,6 +30,7 @@
 #import <ApplicationServices/ApplicationServices.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreServices/CoreServices.h>  // LSSharedFileList (Login Items)
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include "cocoa.h"
 #include <dlfcn.h>
 #include <limits.h>
@@ -115,6 +116,30 @@ static atomic_int       gSEIActive     = 0;    // last observed state
 static atomic_int       gShowWindowlessApps = 0; // user preference: surface
                                                  // running regular apps that
                                                  // have no windows as tiles.
+
+static atomic_int                                  gOverridesEnabled  = 0;
+static NSArray<NSDictionary *>                    *gOverrideRules     = nil;
+static NSMutableDictionary<NSString *, NSImage *> *gOverrideIconCache = nil;
+
+@interface GFSettingsWindowController : NSObject
+    <NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate>
+@property (nonatomic, strong) NSWindow      *settingsWindow;
+@property (nonatomic, strong) NSButton      *bootCheck;
+@property (nonatomic, strong) NSButton      *windowlessCheck;
+@property (nonatomic, strong) NSButton      *focusCheck;
+@property (nonatomic, strong) NSPopUpButton *hotkeyPopup;
+@property (nonatomic, strong) NSPopUpButton *delayPopup;
+@property (nonatomic, strong) NSButton      *seiCheck;
+// Override-rules UI
+@property (nonatomic, strong) NSButton      *overrideEnableCheck;
+@property (nonatomic, strong) NSScrollView  *overrideScrollView;
+@property (nonatomic, strong) NSTableView   *overrideTable;
+@property (nonatomic, strong) NSButton      *overrideRemoveBtn;
+@property (nonatomic, strong) NSMutableArray<NSMutableDictionary *> *overrideData;
+@property (nonatomic, assign) BOOL           allowNextEdit;
+- (void)showSettings:(id)sender;
+@end
+static GFSettingsWindowController *gSettingsController = nil;
 
 @class GFMRUTracker;
 static NSMutableArray<NSNumber *>            *gMRU         = nil;  // CGWindowIDs, front-to-back MRU
@@ -1016,6 +1041,57 @@ static void freePanelData(gf_pd_t *d) {
     free(d);
 }
 
+// Rebuild the override rule list and icon cache from NSUserDefaults.
+// Must be called on the main thread. Sets gOverrideRules / gOverrideIconCache
+// to nil when overrides are disabled, making gf_applyOverride a no-op.
+static void gf_reloadOverrideRules(void) {
+    if (!atomic_load(&gOverridesEnabled)) {
+        gOverrideRules     = nil;
+        gOverrideIconCache = nil;
+        return;
+    }
+    NSArray *saved = [[NSUserDefaults standardUserDefaults]
+        arrayForKey:@"OverrideRules"] ?: @[];
+    NSMutableDictionary *cache = [NSMutableDictionary dictionary];
+    for (NSDictionary *rule in saved) {
+        NSString *path = rule[@"iconPath"];
+        if (path.length > 0 && !cache[path]) {
+            NSImage *img = [[NSImage alloc] initWithContentsOfFile:path];
+            if (img) cache[path] = img;
+        }
+    }
+    gOverrideRules     = [saved copy];
+    gOverrideIconCache = cache;
+}
+
+// Apply the first matching override rule to ge. No-op (single nil check)
+// when overrides are disabled. Matches against ge.title (the window title).
+// Sets ge.appName and/or ge.image; sets ge.thumbLoaded=NO for icon overrides
+// so the image renders centered at icon size rather than stretched.
+static void gf_applyOverride(GFEntry *ge) {
+    if (!gOverrideRules) return;
+    for (NSDictionary *rule in gOverrideRules) {
+        NSString *match = rule[@"matchString"];
+        if (match.length == 0) continue;
+        BOOL hit;
+        if ([rule[@"matchType"] isEqualToString:@"exact"]) {
+            hit = [ge.title isEqualToString:match];
+        } else {
+            hit = [ge.title rangeOfString:match
+                                  options:NSCaseInsensitiveSearch].location != NSNotFound;
+        }
+        if (!hit) continue;
+        NSString *name = rule[@"displayName"];
+        if (name.length > 0) ge.appName = name;
+        NSString *path = rule[@"iconPath"];
+        if (path.length > 0) {
+            NSImage *img = gOverrideIconCache[path];
+            if (img) { ge.image = img; ge.thumbLoaded = NO; }
+        }
+        break;
+    }
+}
+
 // Main-thread only. Build GFEntry objects from panel data, populating thumbs
 // from the cache when present and falling back to the app icon otherwise.
 static NSArray<GFEntry *> *gf_buildEntries(gf_pd_t *d) {
@@ -1046,6 +1122,7 @@ static NSArray<GFEntry *> *gf_buildEntries(gf_pd_t *d) {
                 runningApplicationWithProcessIdentifier:(pid_t)e->pid];
             ge.image = app.icon;
         }
+        gf_applyOverride(ge);
         [items addObject:ge];
     }
     return items;
@@ -1951,21 +2028,10 @@ static void gf_setupMRUTracking(void) {
 // =========================================================================
 
 @interface GFStatusHandler : NSObject
-@property (nonatomic, weak) NSMenuItem *seiItem;
-@property (nonatomic, weak) NSMenuItem *bootItem;
-@property (nonatomic, weak) NSMenuItem *windowlessItem;
-@property (nonatomic, weak) NSMenuItem *focusButtonItem;
-@property (nonatomic, strong) NSArray<NSMenuItem *> *hotkeyItems;
-@property (nonatomic, strong) NSArray<NSMenuItem *> *quickDelayItems;
 - (void)showGrid:(id)sender;
 - (void)minimizeAll:(id)sender;
 - (void)cascadeAll:(id)sender;
-- (void)toggleSEIDetection:(id)sender;
-- (void)toggleWindowlessApps:(id)sender;
-- (void)toggleFocusButton:(id)sender;
-- (void)toggleStartAtBoot:(id)sender;
-- (void)changeHotkey:(NSMenuItem *)sender;
-- (void)changeQuickDelay:(NSMenuItem *)sender;
+- (void)showSettings:(id)sender;
 - (void)quit:(id)sender;
 @end
 
@@ -1975,80 +2041,13 @@ static void gf_applySEIState(BOOL active);
 
 @implementation GFStatusHandler
 - (void)showGrid:(id)sender {
-    // If the grid is somehow already up, close it first so this acts as a
-    // clean re-open rather than triggering a cycle.
     if (atomic_load(&gActive)) gfOnCancel();
     gfOnHotkey(0, 0);
 }
 - (void)minimizeAll:(id)sender { gf_minimizeAll(); }
 - (void)cascadeAll:(id)sender  { gf_cascadeAll();  }
-- (void)toggleWindowlessApps:(id)sender {
-    int next = atomic_load(&gShowWindowlessApps) ? 0 : 1;
-    atomic_store(&gShowWindowlessApps, next);
-    [[NSUserDefaults standardUserDefaults] setBool:(next ? YES : NO)
-                                            forKey:@"ShowWindowlessApps"];
-    self.windowlessItem.state = next ? NSControlStateValueOn : NSControlStateValueOff;
-}
-- (void)toggleFocusButton:(id)sender {
-    int next = atomic_load(&gShowFocusButton) ? 0 : 1;
-    atomic_store(&gShowFocusButton, next);
-    [[NSUserDefaults standardUserDefaults] setBool:(next ? YES : NO)
-                                            forKey:@"ShowFocusButton"];
-    self.focusButtonItem.state = next ? NSControlStateValueOn : NSControlStateValueOff;
-}
-- (void)toggleSEIDetection:(id)sender {
-    int next = atomic_load(&gSEIDetection) ? 0 : 1;
-    atomic_store(&gSEIDetection, next);
-    [[NSUserDefaults standardUserDefaults] setBool:(next ? YES : NO)
-                                            forKey:@"SEIDetection"];
-    self.seiItem.state = next ? NSControlStateValueOn : NSControlStateValueOff;
-    if (next) {
-        gf_startSEITimer();
-    } else {
-        gf_stopSEITimer();
-        // Clear any "unavailable" indication that was showing.
-        gf_applySEIState(NO);
-    }
-}
-- (void)toggleStartAtBoot:(id)sender {
-    BOOL installed = gf_isLoginItemInstalled() ? YES : NO;
-    int rc = installed ? gf_uninstallLoginItem() : gf_installLoginItem();
-    if (rc != 0) {
-        NSAlert *alert = [[NSAlert alloc] init];
-        alert.messageText = installed
-            ? @"Couldn't remove go_fish from Login Items."
-            : @"Couldn't add go_fish to Login Items.";
-        alert.informativeText = @"See the go_fish stderr log for details.";
-        [alert runModal];
-    }
-    BOOL nowOn = gf_isLoginItemInstalled() ? YES : NO;
-    self.bootItem.state = nowOn ? NSControlStateValueOn : NSControlStateValueOff;
-    if (rc == 0 && nowOn != installed) {
-        NSAlert *alert = [[NSAlert alloc] init];
-        alert.messageText = nowOn
-            ? @"Start at boot enabled."
-            : @"Start at boot disabled.";
-        alert.informativeText = nowOn
-            ? @"go_fish will launch automatically on your next login. (No change to the currently-running instance.)"
-            : @"go_fish will not auto-launch on next login. The current instance keeps running until you quit it.";
-        [alert runModal];
-    }
-}
-- (void)changeHotkey:(NSMenuItem *)sender {
-    int choice = (int)sender.tag;
-    atomic_store(&gHotkeyModifier, choice);
-    [[NSUserDefaults standardUserDefaults] setInteger:choice forKey:@"HotkeyModifier"];
-    for (NSMenuItem *item in self.hotkeyItems) {
-        item.state = (item.tag == choice) ? NSControlStateValueOn : NSControlStateValueOff;
-    }
-}
-- (void)changeQuickDelay:(NSMenuItem *)sender {
-    int ms = (int)sender.tag;
-    atomic_store(&gQuickSwitchDelayMs, ms);
-    [[NSUserDefaults standardUserDefaults] setInteger:ms forKey:@"QuickSwitchDelayMs"];
-    for (NSMenuItem *item in self.quickDelayItems) {
-        item.state = (item.tag == ms) ? NSControlStateValueOn : NSControlStateValueOff;
-    }
+- (void)showSettings:(id)sender {
+    [gSettingsController showSettings:nil];
 }
 - (void)quit:(id)sender {
     [NSApp terminate:nil];
@@ -2355,6 +2354,434 @@ static void gf_stopSEITimer(void) {
     gSEITimer = nil;
 }
 
+// =========================================================================
+// Settings window
+// =========================================================================
+
+@implementation GFSettingsWindowController
+
+// ---- Helpers ----
+
+- (void)syncOverrideUIEnabled {
+    BOOL on = (self.overrideEnableCheck.state == NSControlStateValueOn);
+    self.overrideScrollView.alphaValue = on ? 1.0 : 0.4;
+    self.overrideRemoveBtn.enabled     = on && (self.overrideTable.selectedRow >= 0);
+    self.overrideTable.enabled         = on;
+}
+
+- (void)saveOverrideRules {
+    [[NSUserDefaults standardUserDefaults]
+        setObject:[self.overrideData copy] forKey:@"OverrideRules"];
+    gf_reloadOverrideRules();
+}
+
+// ---- Public entry point ----
+
+- (void)showSettings:(id)sender {
+    if (!self.settingsWindow) [self buildWindow];
+
+    self.bootCheck.state = gf_isLoginItemInstalled()
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    self.windowlessCheck.state = atomic_load(&gShowWindowlessApps)
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    self.focusCheck.state = atomic_load(&gShowFocusButton)
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    self.seiCheck.state = atomic_load(&gSEIDetection)
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    [self.hotkeyPopup selectItemAtIndex:atomic_load(&gHotkeyModifier)];
+    int cd = atomic_load(&gQuickSwitchDelayMs);
+    [self.delayPopup selectItemAtIndex:(cd == 75) ? 0 : (cd == 150) ? 2 : 1];
+
+    BOOL ovOn = atomic_load(&gOverridesEnabled) ? YES : NO;
+    self.overrideEnableCheck.state =
+        ovOn ? NSControlStateValueOn : NSControlStateValueOff;
+    NSArray *saved = [[NSUserDefaults standardUserDefaults]
+        arrayForKey:@"OverrideRules"] ?: @[];
+    self.overrideData = [NSMutableArray arrayWithCapacity:saved.count];
+    for (NSDictionary *d in saved)
+        [self.overrideData addObject:[d mutableCopy]];
+    [self.overrideTable reloadData];
+    [self syncOverrideUIEnabled];
+
+    [self.settingsWindow makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+}
+
+// ---- Window construction ----
+
+- (void)buildWindow {
+    const CGFloat W      = 620;
+    const CGFloat margin = 20;
+    const CGFloat checkW = W - 2 * margin;
+    const CGFloat labelW = 148;
+    const CGFloat popupX = margin + labelW + 8;
+    const CGFloat popupW = W - popupX - margin;
+
+    CGFloat y = margin;
+
+    CGFloat seiY        = y; y += 22 + 8;
+    CGFloat diagLabelY  = y; y += 16 + 10;
+    CGFloat sep3Y       = y; y += 1  + 12;
+
+    CGFloat btnRowY     = y; y += 24 + 4;
+    CGFloat tableY      = y; y += 140 + 6;
+    CGFloat ovEnableY   = y; y += 22 + 6;
+    CGFloat ovLabelY    = y; y += 16 + 10;
+    CGFloat sep2Y       = y; y += 1  + 12;
+
+    CGFloat delayY      = y; y += 24 + 8;
+    CGFloat hotkeyY     = y; y += 24 + 8;
+    CGFloat focusY      = y; y += 22 + 8;
+    CGFloat windowlessY = y; y += 22 + 8;
+    CGFloat behLabelY   = y; y += 16 + 10;
+    CGFloat sep1Y       = y; y += 1  + 12;
+
+    CGFloat bootY       = y; y += 22 + 8;
+    CGFloat genLabelY   = y; y += 16 + margin;
+
+    const CGFloat H = y;
+
+    NSWindow *win = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(0, 0, W, H)
+                  styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    win.title = @"go_fish Settings";
+    win.delegate = self;
+    [win center];
+    win.releasedWhenClosed = NO;
+    [[win standardWindowButton:NSWindowZoomButton] setHidden:YES];
+    [[win standardWindowButton:NSWindowMiniaturizeButton] setHidden:YES];
+    NSView *cv = win.contentView;
+
+    void (^addSectionLabel)(NSString *, CGFloat) = ^(NSString *t, CGFloat ly) {
+        NSTextField *f = [NSTextField labelWithString:t];
+        f.font = [NSFont boldSystemFontOfSize:[NSFont smallSystemFontSize]];
+        f.textColor = [NSColor secondaryLabelColor];
+        f.frame = NSMakeRect(margin, ly, checkW, 16);
+        [cv addSubview:f];
+    };
+
+    void (^addSeparator)(CGFloat) = ^(CGFloat sy) {
+        NSBox *sep = [[NSBox alloc] initWithFrame:NSMakeRect(margin, sy, checkW, 1)];
+        sep.boxType = NSBoxSeparator;
+        [cv addSubview:sep];
+    };
+
+    NSButton *(^addCheck)(NSString *, CGFloat, SEL) =
+        ^NSButton *(NSString *t, CGFloat cy, SEL sel) {
+            NSButton *b = [NSButton checkboxWithTitle:t target:self action:sel];
+            b.frame = NSMakeRect(margin, cy, checkW, 22);
+            [cv addSubview:b];
+            return b;
+        };
+
+    NSPopUpButton *(^addPopupRow)(NSString *, NSArray<NSString *> *, CGFloat, SEL) =
+        ^NSPopUpButton *(NSString *lbl, NSArray<NSString *> *opts, CGFloat ry, SEL sel) {
+            NSTextField *lf = [NSTextField labelWithString:lbl];
+            lf.alignment = NSTextAlignmentRight;
+            lf.frame = NSMakeRect(margin, ry + 4, labelW, 16);
+            [cv addSubview:lf];
+            NSPopUpButton *pb = [[NSPopUpButton alloc]
+                initWithFrame:NSMakeRect(popupX, ry, popupW, 24) pullsDown:NO];
+            for (NSString *s in opts) [pb addItemWithTitle:s];
+            pb.target = self;
+            pb.action = sel;
+            [cv addSubview:pb];
+            return pb;
+        };
+
+    // ---- GENERAL ----
+    addSectionLabel(@"GENERAL", genLabelY);
+    self.bootCheck = addCheck(@"Start at boot", bootY, @selector(toggleBoot:));
+    addSeparator(sep1Y);
+
+    // ---- BEHAVIOR ----
+    addSectionLabel(@"BEHAVIOR", behLabelY);
+    self.windowlessCheck = addCheck(@"Show apps without windows",
+                                    windowlessY, @selector(toggleWindowless:));
+    self.focusCheck = addCheck(@"Show focus button in grid",
+                               focusY, @selector(toggleFocusButton:));
+    self.hotkeyPopup = addPopupRow(@"Hotkey:",
+        @[@"Cmd+Tab (default)", @"Ctrl+Tab", @"Option+Tab"],
+        hotkeyY, @selector(changeHotkey:));
+    self.delayPopup = addPopupRow(@"Quick switch delay:",
+        @[@"75 ms", @"100 ms (default)", @"150 ms"],
+        delayY, @selector(changeDelay:));
+    addSeparator(sep2Y);
+
+    // ---- OVERRIDES ----
+    addSectionLabel(@"OVERRIDES", ovLabelY);
+    self.overrideEnableCheck = addCheck(@"Enable window title overrides",
+                                        ovEnableY, @selector(toggleOverridesEnabled:));
+
+    NSScrollView *sv = [[NSScrollView alloc]
+        initWithFrame:NSMakeRect(margin, tableY, checkW, 140)];
+    sv.hasVerticalScroller = YES;
+    sv.autohidesScrollers  = YES;
+    sv.borderType          = NSBezelBorder;
+
+    NSTableView *tv = [[NSTableView alloc] initWithFrame:NSMakeRect(0, 0, checkW, 140)];
+    tv.usesAlternatingRowBackgroundColors = YES;
+    tv.rowHeight  = 20;
+    tv.dataSource = self;
+    tv.delegate   = self;
+    tv.doubleAction = @selector(tableDoubleClicked:);
+    tv.target       = self;
+    // Last column auto-fills remaining width so the vertical scrollbar never clips columns.
+    tv.columnAutoresizingStyle = NSTableViewLastColumnOnlyAutoresizingStyle;
+    tv.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+
+    CGFloat colWidths[] = {160, 90, 140, 0};
+    NSString *colIDs[]    = {@"matchString", @"matchType", @"displayName", @"iconPath"};
+    NSString *colTitles[] = {@"Match String", @"Match Type", @"New Process Name", @"New Icon (double-click)"};
+    CGFloat usedW = colWidths[0] + colWidths[1] + colWidths[2];
+    colWidths[3] = checkW - usedW - 3;
+    if (colWidths[3] < 40) colWidths[3] = 40;
+
+    for (int c = 0; c < 4; c++) {
+        NSTableColumn *col = [[NSTableColumn alloc] initWithIdentifier:colIDs[c]];
+        col.title        = colTitles[c];
+        col.width        = colWidths[c];
+        col.minWidth     = 40;
+        col.resizingMask = NSTableColumnUserResizingMask;
+        if (c == 1) {
+            NSPopUpButtonCell *pc = [[NSPopUpButtonCell alloc]
+                initTextCell:@"" pullsDown:NO];
+            [pc addItemWithTitle:@"Substring"];
+            [pc addItemWithTitle:@"Exact"];
+            pc.controlSize = NSControlSizeSmall;
+            pc.font        = [NSFont systemFontOfSize:
+                [NSFont systemFontSizeForControlSize:NSControlSizeSmall]];
+            pc.bordered    = NO;
+            col.dataCell   = pc;
+        } else {
+            NSTextFieldCell *tc = [[NSTextFieldCell alloc] initTextCell:@""];
+            tc.editable      = (c != 3);
+            tc.selectable    = (c != 3);
+            tc.font          = [NSFont systemFontOfSize:
+                [NSFont systemFontSizeForControlSize:NSControlSizeSmall]];
+            tc.lineBreakMode = NSLineBreakByTruncatingTail;
+            col.dataCell     = tc;
+        }
+        [tv addTableColumn:col];
+    }
+
+    sv.documentView = tv;
+    [cv addSubview:sv];
+    self.overrideScrollView = sv;
+    self.overrideTable      = tv;
+
+    CGFloat bx = margin;
+    NSButton *addBtn = [[NSButton alloc] initWithFrame:NSMakeRect(bx, btnRowY, 24, 24)];
+    addBtn.bezelStyle = NSBezelStyleSmallSquare;
+    addBtn.title      = @"+";
+    addBtn.target     = self;
+    addBtn.action     = @selector(addOverrideRule:);
+    [cv addSubview:addBtn]; bx += 24 + 4;
+
+    self.overrideRemoveBtn = [[NSButton alloc] initWithFrame:NSMakeRect(bx, btnRowY, 24, 24)];
+    self.overrideRemoveBtn.bezelStyle = NSBezelStyleSmallSquare;
+    self.overrideRemoveBtn.title      = @"−";
+    self.overrideRemoveBtn.target     = self;
+    self.overrideRemoveBtn.action     = @selector(removeOverrideRule:);
+    [cv addSubview:self.overrideRemoveBtn];
+
+    addSeparator(sep3Y);
+
+    // ---- DIAGNOSTICS ----
+    addSectionLabel(@"DIAGNOSTICS", diagLabelY);
+    self.seiCheck = addCheck(@"Secure Event Input detection",
+                              seiY, @selector(toggleSEI:));
+
+    self.settingsWindow = win;
+}
+
+// ---- NSTableViewDataSource ----
+
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tv {
+    return (NSInteger)self.overrideData.count;
+}
+
+- (id)tableView:(NSTableView *)tv
+    objectValueForTableColumn:(NSTableColumn *)col
+                          row:(NSInteger)row {
+    NSMutableDictionary *rule = self.overrideData[(NSUInteger)row];
+    NSString *ident = col.identifier;
+    if ([ident isEqualToString:@"matchType"])
+        return [rule[@"matchType"] isEqualToString:@"exact"] ? @1 : @0;
+    if ([ident isEqualToString:@"iconPath"]) {
+        NSString *path = rule[@"iconPath"] ?: @"";
+        return path.length > 0 ? path.lastPathComponent : @"";
+    }
+    return rule[ident] ?: @"";
+}
+
+- (void)tableView:(NSTableView *)tv
+   setObjectValue:(id)obj
+   forTableColumn:(NSTableColumn *)col
+              row:(NSInteger)row {
+    if (row < 0 || row >= (NSInteger)self.overrideData.count) return;
+    NSMutableDictionary *rule = self.overrideData[(NSUInteger)row];
+    NSString *ident = col.identifier;
+    if ([ident isEqualToString:@"matchType"]) {
+        rule[@"matchType"] = ([obj integerValue] == 1) ? @"exact" : @"substring";
+    } else if (![ident isEqualToString:@"iconPath"]) {
+        rule[ident] = obj ?: @"";
+    }
+    [self saveOverrideRules];
+}
+
+// ---- NSTableViewDelegate ----
+
+- (BOOL)tableView:(NSTableView *)tv shouldEditTableColumn:(NSTableColumn *)col row:(NSInteger)row {
+    if ([col.identifier isEqualToString:@"iconPath"]) return NO;
+    if ([col.identifier isEqualToString:@"matchType"]) return YES;
+    // Text columns only edit when explicitly triggered from double-click.
+    if (self.allowNextEdit) { self.allowNextEdit = NO; return YES; }
+    return NO;
+}
+
+- (void)tableViewSelectionDidChange:(NSNotification *)note {
+    BOOL on  = (self.overrideEnableCheck.state == NSControlStateValueOn);
+    BOOL sel = (self.overrideTable.selectedRow >= 0);
+    self.overrideRemoveBtn.enabled = on && sel;
+}
+
+// ---- Override CRUD ----
+
+- (void)toggleOverridesEnabled:(NSButton *)sender {
+    int next = (sender.state == NSControlStateValueOn) ? 1 : 0;
+    atomic_store(&gOverridesEnabled, next);
+    [[NSUserDefaults standardUserDefaults] setBool:(next ? YES : NO)
+                                            forKey:@"OverridesEnabled"];
+    gf_reloadOverrideRules();
+    [self syncOverrideUIEnabled];
+}
+
+- (void)addOverrideRule:(id)sender {
+    [self.overrideData addObject:[@{
+        @"matchString": @"",
+        @"matchType":   @"substring",
+        @"displayName": @"",
+        @"iconPath":    @""
+    } mutableCopy]];
+    [self.overrideTable reloadData];
+    NSInteger newRow = (NSInteger)self.overrideData.count - 1;
+    [self.overrideTable selectRowIndexes:[NSIndexSet indexSetWithIndex:(NSUInteger)newRow]
+                    byExtendingSelection:NO];
+    [self.overrideTable scrollRowToVisible:newRow];
+    [self saveOverrideRules];
+    [self syncOverrideUIEnabled];
+}
+
+- (void)removeOverrideRule:(id)sender {
+    NSInteger row = self.overrideTable.selectedRow;
+    if (row < 0 || row >= (NSInteger)self.overrideData.count) return;
+    [self.overrideData removeObjectAtIndex:(NSUInteger)row];
+    [self.overrideTable reloadData];
+    [self saveOverrideRules];
+    [self syncOverrideUIEnabled];
+}
+
+- (void)tableDoubleClicked:(NSTableView *)tv {
+    NSInteger col = tv.clickedColumn;
+    NSInteger row = tv.clickedRow;
+    if (col < 0 || row < 0) return;
+    if (self.overrideEnableCheck.state != NSControlStateValueOn) return;
+    NSString *ident = [tv.tableColumns[col] identifier];
+    if ([ident isEqualToString:@"iconPath"]) {
+        [self setOverrideIcon:tv];
+    } else if (![ident isEqualToString:@"matchType"]) {
+        // Text column — open the cell editor.
+        self.allowNextEdit = YES;
+        [tv editColumn:col row:row withEvent:nil select:YES];
+    }
+    // matchType: popup cell handles its own click tracking; no action needed here.
+}
+
+- (void)setOverrideIcon:(id)sender {
+    NSInteger row = self.overrideTable.selectedRow;
+    if (row < 0 || row >= (NSInteger)self.overrideData.count) return;
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.title = @"Choose Icon";
+    panel.allowedFileTypes = @[@"icns", @"ico", @"png"];
+    panel.allowsMultipleSelection = NO;
+    panel.canChooseDirectories    = NO;
+    [panel beginSheetModalForWindow:self.settingsWindow
+                  completionHandler:^(NSModalResponse r) {
+        if (r != NSModalResponseOK) return;
+        NSString *path = panel.URL.path;
+        if (!path) return;
+        self.overrideData[(NSUInteger)row][@"iconPath"] = path;
+        [self.overrideTable reloadData];
+        [self saveOverrideRules];
+    }];
+}
+
+// ---- Existing settings actions ----
+
+- (void)toggleBoot:(NSButton *)sender {
+    BOOL on = (sender.state == NSControlStateValueOn);
+    int rc = on ? gf_installLoginItem() : gf_uninstallLoginItem();
+    if (rc != 0) {
+        NSAlert *a = [[NSAlert alloc] init];
+        a.messageText = on ? @"Couldn't add go_fish to Login Items."
+                           : @"Couldn't remove go_fish from Login Items.";
+        a.informativeText = @"See the go_fish stderr log for details.";
+        [a runModal];
+    }
+    sender.state = gf_isLoginItemInstalled()
+        ? NSControlStateValueOn : NSControlStateValueOff;
+}
+
+- (void)toggleWindowless:(NSButton *)sender {
+    int next = (sender.state == NSControlStateValueOn) ? 1 : 0;
+    atomic_store(&gShowWindowlessApps, next);
+    [[NSUserDefaults standardUserDefaults] setBool:(next ? YES : NO)
+                                            forKey:@"ShowWindowlessApps"];
+}
+
+- (void)toggleFocusButton:(NSButton *)sender {
+    int next = (sender.state == NSControlStateValueOn) ? 1 : 0;
+    atomic_store(&gShowFocusButton, next);
+    [[NSUserDefaults standardUserDefaults] setBool:(next ? YES : NO)
+                                            forKey:@"ShowFocusButton"];
+}
+
+- (void)changeHotkey:(NSPopUpButton *)sender {
+    int choice = (int)sender.indexOfSelectedItem;
+    atomic_store(&gHotkeyModifier, choice);
+    [[NSUserDefaults standardUserDefaults] setInteger:choice forKey:@"HotkeyModifier"];
+}
+
+- (void)changeDelay:(NSPopUpButton *)sender {
+    int vals[] = {75, 100, 150};
+    int ms = vals[(int)sender.indexOfSelectedItem];
+    atomic_store(&gQuickSwitchDelayMs, ms);
+    [[NSUserDefaults standardUserDefaults] setInteger:ms forKey:@"QuickSwitchDelayMs"];
+}
+
+- (void)toggleSEI:(NSButton *)sender {
+    int next = (sender.state == NSControlStateValueOn) ? 1 : 0;
+    atomic_store(&gSEIDetection, next);
+    [[NSUserDefaults standardUserDefaults] setBool:(next ? YES : NO)
+                                            forKey:@"SEIDetection"];
+    if (next) {
+        gf_startSEITimer();
+    } else {
+        gf_stopSEITimer();
+        gf_applySEIState(NO);
+    }
+}
+
+- (BOOL)windowShouldClose:(NSWindow *)sender {
+    [sender orderOut:nil];
+    return NO;
+}
+
+@end
+
 static void installStatusItem(const void *iconBytes, int iconLen) {
     NSImage *icon = gf_makeMenuIcon(iconBytes, iconLen);
     gIconNormal    = icon;
@@ -2371,8 +2798,12 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
                                  @"ShowWindowlessApps": @NO,
                                  @"ShowFocusButton": @YES,
                                  @"HotkeyModifier": @0,
-                                 @"QuickSwitchDelayMs": @100}];
+                                 @"QuickSwitchDelayMs": @100,
+                                 @"OverridesEnabled": @NO,
+                                 @"OverrideRules": @[]}];
     atomic_store(&gSEIDetection, [defaults boolForKey:@"SEIDetection"] ? 1 : 0);
+    atomic_store(&gOverridesEnabled, [defaults boolForKey:@"OverridesEnabled"] ? 1 : 0);
+    gf_reloadOverrideRules();
     atomic_store(&gShowWindowlessApps,
                  [defaults boolForKey:@"ShowWindowlessApps"] ? 1 : 0);
     atomic_store(&gShowFocusButton,
@@ -2403,100 +2834,12 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
 
     [menu addItem:[NSMenuItem separatorItem]];
 
-    // --- Configuration submenu ---
-    NSMenu *configMenu = [[NSMenu alloc] init];
-
-    NSMenuItem *bootItem = [[NSMenuItem alloc] initWithTitle:@"Start at boot"
-                                                      action:@selector(toggleStartAtBoot:)
-                                               keyEquivalent:@""];
-    bootItem.target = gStatusHandler;
-    bootItem.state  = gf_isLoginItemInstalled()
-        ? NSControlStateValueOn : NSControlStateValueOff;
-    gStatusHandler.bootItem = bootItem;
-    [configMenu addItem:bootItem];
-
-    [configMenu addItem:[NSMenuItem separatorItem]];
-
-    NSMenuItem *seiItem = [[NSMenuItem alloc] initWithTitle:@"Secure Event Input detection"
-                                                     action:@selector(toggleSEIDetection:)
-                                              keyEquivalent:@""];
-    seiItem.target = gStatusHandler;
-    seiItem.state  = atomic_load(&gSEIDetection)
-        ? NSControlStateValueOn : NSControlStateValueOff;
-    gStatusHandler.seiItem = seiItem;
-    [configMenu addItem:seiItem];
-
-    NSMenuItem *windowlessItem =
-        [[NSMenuItem alloc] initWithTitle:@"Show apps without windows"
-                                   action:@selector(toggleWindowlessApps:)
-                            keyEquivalent:@""];
-    windowlessItem.target = gStatusHandler;
-    windowlessItem.state  = atomic_load(&gShowWindowlessApps)
-        ? NSControlStateValueOn : NSControlStateValueOff;
-    gStatusHandler.windowlessItem = windowlessItem;
-    [configMenu addItem:windowlessItem];
-
-    NSMenuItem *focusButtonItem =
-        [[NSMenuItem alloc] initWithTitle:@"Show focus button in grid"
-                                   action:@selector(toggleFocusButton:)
-                            keyEquivalent:@""];
-    focusButtonItem.target = gStatusHandler;
-    focusButtonItem.state  = atomic_load(&gShowFocusButton)
-        ? NSControlStateValueOn : NSControlStateValueOff;
-    gStatusHandler.focusButtonItem = focusButtonItem;
-    [configMenu addItem:focusButtonItem];
-
-    [configMenu addItem:[NSMenuItem separatorItem]];
-
-    int currentMod = atomic_load(&gHotkeyModifier);
-    NSMenu *hotkeyMenu = [[NSMenu alloc] init];
-    NSArray<NSString *> *hotkeyLabels = @[@"Cmd+Tab (default)", @"Ctrl+Tab", @"Option+Tab"];
-    NSMutableArray<NSMenuItem *> *hotkeyItems = [NSMutableArray arrayWithCapacity:3];
-    for (NSInteger i = 0; i < (NSInteger)hotkeyLabels.count; i++) {
-        NSMenuItem *hi = [[NSMenuItem alloc] initWithTitle:hotkeyLabels[i]
-                                                    action:@selector(changeHotkey:)
-                                             keyEquivalent:@""];
-        hi.target = gStatusHandler;
-        hi.tag    = i;
-        hi.state  = (i == currentMod) ? NSControlStateValueOn : NSControlStateValueOff;
-        [hotkeyMenu addItem:hi];
-        [hotkeyItems addObject:hi];
-    }
-    gStatusHandler.hotkeyItems = hotkeyItems;
-    NSMenuItem *hotkeyParent = [[NSMenuItem alloc] initWithTitle:@"Switch hotkey"
-                                                          action:nil
-                                                   keyEquivalent:@""];
-    hotkeyParent.submenu = hotkeyMenu;
-    [configMenu addItem:hotkeyParent];
-
-    int currentDelay = atomic_load(&gQuickSwitchDelayMs);
-    NSMenu *delayMenu = [[NSMenu alloc] init];
-    NSArray<NSNumber *> *delayValues = @[@75, @100, @150];
-    NSArray<NSString *> *delayLabels = @[@"75 ms", @"100 ms (default)", @"150 ms"];
-    NSMutableArray<NSMenuItem *> *delayItems = [NSMutableArray arrayWithCapacity:3];
-    for (NSInteger i = 0; i < (NSInteger)delayValues.count; i++) {
-        int ms = delayValues[i].intValue;
-        NSMenuItem *di = [[NSMenuItem alloc] initWithTitle:delayLabels[i]
-                                                    action:@selector(changeQuickDelay:)
-                                             keyEquivalent:@""];
-        di.target = gStatusHandler;
-        di.tag    = ms;
-        di.state  = (ms == currentDelay) ? NSControlStateValueOn : NSControlStateValueOff;
-        [delayMenu addItem:di];
-        [delayItems addObject:di];
-    }
-    gStatusHandler.quickDelayItems = delayItems;
-    NSMenuItem *delayParent = [[NSMenuItem alloc] initWithTitle:@"Quick Switch Delay"
-                                                         action:nil
-                                                  keyEquivalent:@""];
-    delayParent.submenu = delayMenu;
-    [configMenu addItem:delayParent];
-
-    NSMenuItem *configParent = [[NSMenuItem alloc] initWithTitle:@"Configuration"
-                                                          action:nil
-                                                   keyEquivalent:@""];
-    configParent.submenu = configMenu;
-    [menu addItem:configParent];
+    gSettingsController = [GFSettingsWindowController new];
+    NSMenuItem *settingsItem = [[NSMenuItem alloc] initWithTitle:@"Settings…"
+                                                          action:@selector(showSettings:)
+                                                   keyEquivalent:@","];
+    settingsItem.target = gStatusHandler;
+    [menu addItem:settingsItem];
 
     [menu addItem:[NSMenuItem separatorItem]];
 
