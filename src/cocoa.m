@@ -1269,7 +1269,7 @@ void gf_updateSelection(int selected) {
 
 void gf_hidePanel(void) {
     atomic_store(&gActive, 0);
-    dispatch_async(dispatch_get_main_queue(), ^{
+    void (^hide)(void) = ^{
         if (gPanelView) {
             // Drop NSImage refs immediately so their CGImage bitmaps can be
             // freed; on retina screens these add up fast (~800 KB each).
@@ -1282,7 +1282,16 @@ void gf_hidePanel(void) {
         if (gPanel) [gPanel orderOut:nil];
         // Reclaim the thumbnail cache once the panel has stayed closed a while.
         gf_scheduleThumbPurge();
-    });
+    };
+    // When called from the main thread (e.g. a mouse-down handler) run the
+    // hide immediately so the panel is gone before the cascade or focus work
+    // dispatched right after us executes.  From any other thread, dispatch
+    // async as before.
+    if (NSThread.isMainThread) {
+        hide();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), hide);
+    }
 }
 
 // =========================================================================
@@ -1475,10 +1484,40 @@ void gf_cascadeAll(void) {
             if (targetW < 480)  targetW = 480;
             if (targetH < 320)  targetH = 320;
 
-            int moved = 0, resized = 0, skipped = 0;
+            // Cascade is user-initiated and can afford to wait. Set a longer
+            // AX timeout per app so that busy apps (e.g. Firefox rendering
+            // a heavy page) don't time out on the resize call. The 0.1s
+            // timeout from enumeration is too short when the app is under load.
+            NSMutableDictionary<NSNumber *, NSValue *> *cascadeAxApps =
+                [NSMutableDictionary dictionary];
             for (int i = 0; i < n; i++) {
+                if (!w[i].axRef) continue;
+                NSNumber *pidKey = @(w[i].pid);
+                if (!cascadeAxApps[pidKey]) {
+                    AXUIElementRef axApp =
+                        AXUIElementCreateApplication((pid_t)w[i].pid);
+                    if (axApp) {
+                        AXUIElementSetMessagingTimeout(axApp, 2.0f);
+                        cascadeAxApps[pidKey] =
+                            [NSValue valueWithPointer:(void *)axApp];
+                    }
+                }
+            }
+
+            int moved = 0, resized = 0, skipped = 0, step = 0;
+            // Iterate back-to-front: backmost window gets step 0 (NW), each
+            // more-front window steps down-right. The frontmost window is
+            // processed last so if AX writes raise the window, it naturally
+            // ends up on top before the raise loop corrects z-order.
+            for (int i = n - 1; i >= 0; i--) {
                 AXUIElementRef ax = (AXUIElementRef)w[i].axRef;
                 if (!ax) { skipped++; continue; }
+
+                // Skip windows that are neither on the current screen nor
+                // minimized. Background tabs (same-frame NSWindow behind the
+                // frontmost tab) and windows on other Spaces both land here:
+                // they have a valid axRef but onScreen=NO and minimized=NO.
+                if (!w[i].minimized && !w[i].onScreen) { skipped++; continue; }
 
                 if (w[i].minimized) {
                     AXUIElementSetAttributeValue(ax, kAXMinimizedAttribute,
@@ -1531,13 +1570,11 @@ void gf_cascadeAll(void) {
                         (int)szerr, (int)szSettable);
                 }
 
-                // Reversed order: back-most window (highest zOrder) lands at
-                // the top-left, each more-front window steps down-right. The
-                // post-loop raise pass below restores z-order so every
-                // window's title bar peeks out above the one in front of it.
-                int step = (n - 1 - i) % maxStep;
-                CGPoint pt = CGPointMake(axStartX + offset * step,
-                                         axStartY + offset * step);
+                // step increments only for windows that are actually cascaded,
+                // so gaps from skipped windows don't misalign the staircase.
+                int s = step % maxStep;
+                CGPoint pt = CGPointMake(axStartX + offset * s,
+                                         axStartY + offset * s);
                 AXValueRef ptVal = AXValueCreate(kAXValueCGPointType, &pt);
                 if (!ptVal) { skipped++; continue; }
                 AXError perr = AXUIElementSetAttributeValue(ax,
@@ -1550,11 +1587,17 @@ void gf_cascadeAll(void) {
                     skipped++;
                     continue;
                 }
+                step++;
                 moved++;
             }
             fprintf(stderr,
                     "go_fish cascade: moved %d, resized %d, skipped %d of %d (target %.0fx%.0f)\n",
                     moved, resized, skipped, n, targetW, targetH);
+
+            for (NSValue *val in cascadeAxApps.allValues) {
+                AXUIElementRef axApp = (AXUIElementRef)val.pointerValue;
+                CFRelease(axApp);
+            }
 
             // Un-minimize, exit-fullscreen, and (on some apps) the AX
             // position write itself raise the affected window in the global
@@ -1575,7 +1618,8 @@ void gf_cascadeAll(void) {
             // (raises whatever the app already considers main, not the
             // element we passed) — kAXMainAttribute pins it explicitly.
             int raiseCount = 0;
-            for (int i = 0; i < n; i++) if (w[i].axRef) raiseCount++;
+            for (int i = 0; i < n; i++)
+                if (w[i].axRef && (w[i].minimized || w[i].onScreen)) raiseCount++;
             if (raiseCount > 0) {
                 typedef struct { void *axRef; pid_t pid; } gf_raise_item_t;
                 gf_raise_item_t *items =
@@ -1583,6 +1627,7 @@ void gf_cascadeAll(void) {
                 int k = 0;
                 for (int i = n - 1; i >= 0; i--) {  // back-to-front order
                     if (!w[i].axRef) continue;
+                    if (!w[i].minimized && !w[i].onScreen) continue;
                     items[k].axRef = (void *)CFRetain((CFTypeRef)w[i].axRef);
                     items[k].pid   = (pid_t)w[i].pid;
                     k++;
@@ -1653,6 +1698,15 @@ void gf_focusApp(int pid) {
             if (all) {
                 qsort(all, n, sizeof(gf_window_t), gf_cmpZOrder); // front-to-back
 
+                // Longer timeout for cascade resize operations (same reason as
+                // gf_cascadeAll: busy apps can't service AX in 100ms).
+                AXUIElementRef focusAxApp =
+                    AXUIElementCreateApplication((pid_t)pid);
+                if (focusAxApp) {
+                    AXUIElementSetMessagingTimeout(focusAxApp, 2.0f);
+                    CFRelease(focusAxApp);
+                }
+
                 // Minimize every window NOT belonging to pid.
                 for (int i = 0; i < n; i++) {
                     if (all[i].pid == pid || all[i].minimized || !all[i].axRef) continue;
@@ -1665,6 +1719,7 @@ void gf_focusApp(int pid) {
                 int step = 0;
                 for (int i = n - 1; i >= 0; i--) {
                     if (all[i].pid != pid || !all[i].axRef) continue;
+                    if (!all[i].minimized && !all[i].onScreen) continue;
                     AXUIElementRef ax = (AXUIElementRef)all[i].axRef;
 
                     if (all[i].minimized)
