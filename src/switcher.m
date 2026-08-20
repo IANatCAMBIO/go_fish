@@ -48,6 +48,19 @@ static int cmpZOrder(const void *a, const void *b) {
     return (za > zb) - (za < zb);
 }
 
+// Alphabetical by app name (case-insensitive), then window title within each app.
+// Windowless placeholders sort after real windows; unresponsive after windowless.
+static int cmpAppName(const void *a, const void *b) {
+    const gf_window_t *wa = (const gf_window_t *)a;
+    const gf_window_t *wb = (const gf_window_t *)b;
+    int specialA = wa->unresponsive ? 2 : (wa->windowless ? 1 : 0);
+    int specialB = wb->unresponsive ? 2 : (wb->windowless ? 1 : 0);
+    if (specialA != specialB) return specialA - specialB;
+    int appCmp = strcasecmp(wa->appName ? wa->appName : "", wb->appName ? wb->appName : "");
+    if (appCmp != 0) return appCmp;
+    return strcasecmp(wa->title ? wa->title : "", wb->title ? wb->title : "");
+}
+
 // Build the C panel-data blob from the current list. gf_showPanel /
 // gf_updatePanelEntries take ownership and free it. gf_setPanelEntry strdup's
 // the strings, so passing our owned pointers is safe.
@@ -84,7 +97,8 @@ static void snapshotWindows(int filterPID) {
         gSwCount = 0;
         return;
     }
-    qsort(raw, (size_t)n, sizeof(gf_window_t), cmpZOrder);
+    qsort(raw, (size_t)n, sizeof(gf_window_t),
+          gf_getSortMode() ? cmpAppName : cmpZOrder);
     gSwList  = raw;
     gSwCount = n;
 }
@@ -194,6 +208,20 @@ void gfOnFocus(int idx) {
     int pid = gSwList[idx].pid;
     tearDown();
     gf_focusApp(pid);
+    pthread_mutex_unlock(&gSwMu);
+}
+
+void gfToggleSort(void) {
+    pthread_mutex_lock(&gSwMu);
+    if (!gSwOpen || gSwCount == 0) {
+        pthread_mutex_unlock(&gSwMu);
+        return;
+    }
+    gf_toggleSortMode();
+    qsort(gSwList, (size_t)gSwCount, sizeof(gf_window_t),
+          gf_getSortMode() ? cmpAppName : cmpZOrder);
+    gSwSelected = 0;
+    refreshPanel();
     pthread_mutex_unlock(&gSwMu);
 }
 

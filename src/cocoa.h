@@ -71,6 +71,11 @@ void gf_quitApp(int pid);
 // cascades all of pid's windows. Used by the grid eyeball button.
 void gf_focusApp(int pid);
 
+// Sort mode for the grid. 0 = MRU (most-recently-used), 1 = alphabetical by app.
+// gf_toggleSortMode flips the mode, persists it, and returns the new value.
+int gf_getSortMode(void);
+int gf_toggleSortMode(void);
+
 // Bulk window arrangement, driven by the menu-bar status item.
 // Both operate on every standard window of every regular app (same filter
 // gf_enumerateWindows uses).

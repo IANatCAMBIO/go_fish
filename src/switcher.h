@@ -21,3 +21,6 @@ int  gfOnCancel(void);
 void gfSetSelection(int idx);
 int  gfOnClose(int idx);
 void gfOnFocus(int idx);
+// Re-sort the live window list by the current sort mode and refresh the panel.
+// Called when the user clicks the sort toggle in the grid.
+void gfToggleSort(void);

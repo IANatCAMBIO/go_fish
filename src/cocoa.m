@@ -117,6 +117,10 @@ static atomic_int       gShowWindowlessApps = 0; // user preference: surface
                                                  // running regular apps that
                                                  // have no windows as tiles.
 
+// Sort mode for the grid thumbnail display. 0 = MRU (most-recently-used),
+// 1 = alphabetical by application name.
+static atomic_int gSortByApp = 0;
+
 static atomic_int                                  gOverridesEnabled  = 0;
 static NSArray<NSDictionary *>                    *gOverrideRules     = nil;
 static NSMutableDictionary<NSString *, NSImage *> *gOverrideIconCache = nil;
@@ -742,6 +746,14 @@ static NSSize gf_preferredPanelSize(NSInteger n) {
     return NSMakeRect(NSMaxX(r) - d, y, d, d);
 }
 
+// Bottom-right sort toggle: two segments "Recent" | "By App".
+// 58pt each with 1pt gap; 14pt from right edge (inside corner radius), 8pt from bottom.
+static NSRect gf_sortToggleRect(NSRect bounds) {
+    CGFloat segW = 58, h = 16, gap = 1;
+    CGFloat totalW = segW * 2 + gap;
+    return NSMakeRect(NSMaxX(bounds) - totalW - 14, 8, totalW, h);
+}
+
 - (NSInteger)indexAtPoint:(NSPoint)p layout:(gf_layout_t)L {
     NSInteger n = self.entries.count;
     for (NSInteger i = 0; i < n; i++) {
@@ -911,6 +923,46 @@ static void gf_initDrawAttrs(void) {
             }
         }
     }
+
+    // Sort toggle — bottom-right corner, two segments: "Recent" | "By App".
+    {
+        NSRect tr = gf_sortToggleRect(b);
+        CGFloat segW = (tr.size.width - 1) / 2;
+        int sortMode = gf_getSortMode();
+
+        // Outer pill background
+        NSBezierPath *pill = [NSBezierPath bezierPathWithRoundedRect:tr
+                                                             xRadius:tr.size.height / 2
+                                                             yRadius:tr.size.height / 2];
+        [[NSColor colorWithWhite:0.5 alpha:0.12] setFill];
+        [pill fill];
+
+        // Active segment highlight
+        NSRect activeR = NSMakeRect(tr.origin.x + sortMode * (segW + 1),
+                                    tr.origin.y, segW, tr.size.height);
+        NSBezierPath *activePill = [NSBezierPath bezierPathWithRoundedRect:activeR
+                                                                   xRadius:activeR.size.height / 2
+                                                                   yRadius:activeR.size.height / 2];
+        [[NSColor colorWithWhite:0.5 alpha:0.30] setFill];
+        [activePill fill];
+
+        NSString *segLabels[2] = {@"Recent", @"By App"};
+        for (int s = 0; s < 2; s++) {
+            NSRect segR = NSMakeRect(tr.origin.x + s * (segW + 1),
+                                     tr.origin.y, segW, tr.size.height);
+            BOOL isActive = (s == sortMode);
+            NSDictionary *ta = @{
+                NSFontAttributeName: [NSFont systemFontOfSize:10],
+                NSForegroundColorAttributeName: isActive
+                    ? [NSColor secondaryLabelColor]
+                    : [NSColor tertiaryLabelColor],
+            };
+            NSSize ts = [segLabels[s] sizeWithAttributes:ta];
+            [segLabels[s] drawAtPoint:NSMakePoint(NSMidX(segR) - ts.width  / 2,
+                                                   NSMidY(segR) - ts.height / 2 + 0.5)
+                       withAttributes:ta];
+        }
+    }
 }
 
 - (void)updateTrackingAreas {
@@ -938,6 +990,22 @@ static void gf_initDrawAttrs(void) {
 
 - (void)mouseDown:(NSEvent *)e {
     NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+
+    // Sort toggle hit-test: check before tiles so clicks on the toggle
+    // don't fall through to whatever tile happens to be at that position.
+    {
+        NSRect tr = gf_sortToggleRect(self.bounds);
+        if (NSPointInRect(p, tr)) {
+            CGFloat segW = (tr.size.width - 1) / 2;
+            NSRect seg1R = NSMakeRect(tr.origin.x + segW + 1, tr.origin.y, segW, tr.size.height);
+            int clicked = NSPointInRect(p, seg1R) ? 1 : 0;
+            if (clicked != gf_getSortMode()) {
+                gfToggleSort();
+            }
+            return;
+        }
+    }
+
     NSInteger n = self.entries.count;
     if (n == 0) return;
     gf_layout_t L = [self layoutForCount:n];
@@ -1390,6 +1458,17 @@ void gf_quitApp(int pid) {
             [app terminate];
         }
     });
+}
+
+int gf_getSortMode(void) {
+    return atomic_load(&gSortByApp);
+}
+
+int gf_toggleSortMode(void) {
+    int next = atomic_load(&gSortByApp) ? 0 : 1;
+    atomic_store(&gSortByApp, next);
+    [[NSUserDefaults standardUserDefaults] setBool:(next ? YES : NO) forKey:@"SortByApp"];
+    return next;
 }
 
 // qsort comparator: ascending by zOrder (frontmost first).
@@ -2855,7 +2934,8 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
                                  @"HotkeyModifier": @0,
                                  @"QuickSwitchDelayMs": @100,
                                  @"OverridesEnabled": @NO,
-                                 @"OverrideRules": @[]}];
+                                 @"OverrideRules": @[],
+                                 @"SortByApp": @NO}];
     atomic_store(&gSEIDetection, [defaults boolForKey:@"SEIDetection"] ? 1 : 0);
     atomic_store(&gOverridesEnabled, [defaults boolForKey:@"OverridesEnabled"] ? 1 : 0);
     gf_reloadOverrideRules();
@@ -2865,6 +2945,7 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
                  [defaults boolForKey:@"ShowFocusButton"] ? 1 : 0);
     atomic_store(&gHotkeyModifier, (int)[defaults integerForKey:@"HotkeyModifier"]);
     atomic_store(&gQuickSwitchDelayMs, (int)[defaults integerForKey:@"QuickSwitchDelayMs"]);
+    atomic_store(&gSortByApp, [defaults boolForKey:@"SortByApp"] ? 1 : 0);
 
     NSMenu *menu = [[NSMenu alloc] init];
     NSMenuItem *showItem = [[NSMenuItem alloc] initWithTitle:@"Show Window Grid"
