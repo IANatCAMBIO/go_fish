@@ -106,6 +106,34 @@ static uint64_t gf_nowNs(void) {
     return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 }
 
+// Uptime after which MRU tracking resumes. Bulk window operations (Minimize
+// All, Cascade All, focus-app) make every affected app hand focus to a sibling
+// window, and gf_axObserverCallback would otherwise record each of those
+// AXFocusedWindowChanged notifications as a use. Measured on a Minimize All
+// over 11 windows: 6 focus changes fired and 8 of the 11 MRU positions moved,
+// dropping the frontmost window to position 6 — which the next Cascade All
+// then faithfully rendered as a scrambled stack. Rearranging windows is not
+// using them.
+static atomic_ullong gMRUMuteUntilNs = 0;
+
+// Quiet period after the last re-arm. The notifications trail the AX writes
+// that caused them, so the mute has to outlive the operation itself.
+static const double kBulkMRUMute = 2.0;   // seconds
+
+// Suppress MRU tracking for the next kBulkMRUMute seconds. Callers re-arm as
+// they go rather than bracketing begin/end: a cascade runs across the main
+// queue and the placement queue and can take seconds, and a mute that expires
+// on its own can never be leaked by an early return.
+static void gf_muteMRU(void) {
+    atomic_store(&gMRUMuteUntilNs,
+                 gf_nowNs() + (uint64_t)(kBulkMRUMute * NSEC_PER_SEC));
+}
+
+static BOOL gf_mruMuted(void) {
+    uint64_t until = atomic_load(&gMRUMuteUntilNs);
+    return until != 0 && gf_nowNs() < until;
+}
+
 // Eager-push guard: when gf_activateWindow pushes a winID to the MRU front
 // before the OS activation completes, appActivated: may fire shortly after
 // and overwrite it with a stale AX focused-window result. We record the
@@ -1549,11 +1577,13 @@ void gf_minimizeAll(void) {
             int n = 0;
             gf_window_t *w = gf_enumerateWindows(&n, 0);
             if (!w) return;
+            gf_muteMRU();
             for (int i = 0; i < n; i++) {
                 if (!w[i].minimized && w[i].axRef) {
                     AXUIElementSetAttributeValue(
                         (AXUIElementRef)w[i].axRef,
                         kAXMinimizedAttribute, kCFBooleanTrue);
+                    gf_muteMRU();   // re-arm; the storm outlives the loop
                 }
                 free(w[i].title);
                 free(w[i].appName);
@@ -1943,6 +1973,7 @@ static void gf_runPlacement(gf_place_item_t *items, int count,
             for (int i = 0; i < count; i++) {
                 AXUIElementRef ax = items[i].ax;
                 AXUIElementSetMessagingTimeout(ax, kAXPlaceTimeout);
+                gf_muteMRU();
 
                 // Let any animated state change finish before writing
                 // geometry — a restore that completes afterwards undoes it.
@@ -2089,6 +2120,7 @@ static void gf_restoreZOrder(gf_place_item_t *items, int count) {
         for (int pass = 0; pass < kRaisePasses; pass++) {
             for (int i = 0; i < count; i++) {
                 @autoreleasepool {
+                    gf_muteMRU();
                     AXUIElementSetAttributeValue(items[i].ax, kAXMainAttribute,
                                                  kCFBooleanTrue);
                     AXUIElementPerformAction(items[i].ax, kAXRaiseAction);
@@ -2115,6 +2147,7 @@ void gf_cascadeAll(void) {
             int n = 0;
             gf_window_t *w = gf_enumerateWindows(&n, 0);
             if (!w) return;
+            gf_muteMRU();
             // Front-to-back, so the staircase can be walked in reverse below.
             qsort(w, n, sizeof(gf_window_t), gf_cmpZOrder);
 
@@ -2177,6 +2210,7 @@ void gf_focusApp(int pid) {
                 for (int i = 0; i < n; i++) {
                     if (all[i].pid == pid || all[i].minimized || !all[i].axRef)
                         continue;
+                    gf_muteMRU();
                     AXUIElementSetAttributeValue((AXUIElementRef)all[i].axRef,
                         kAXMinimizedAttribute, kCFBooleanTrue);
                 }
@@ -2360,6 +2394,7 @@ static void gf_bootstrapCapture(void) {
 
 static void gf_pushMRU(CGWindowID winID) {
     if (winID == 0 || !gMRU) return;
+    if (gf_mruMuted()) return;
     NSNumber *boxed = @(winID);
     [gMRU removeObject:boxed];
     [gMRU insertObject:boxed atIndex:0];
