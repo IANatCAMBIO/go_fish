@@ -159,6 +159,12 @@ static atomic_int       gShowWindowlessApps = 0; // user preference: surface
                                                  // running regular apps that
                                                  // have no windows as tiles.
 
+// 1 = minimized windows sort behind every live window in the grid, however
+// recently they were used (default on). A minimized window is not something
+// the user is looking at, so letting it hold a front rank pushes the windows
+// they can actually see off the first row. Off restores the raw recency rank.
+static atomic_int       gMinimizedLast = 1;
+
 // Sort mode for the grid thumbnail display. 0 = MRU (most-recently-used),
 // 1 = alphabetical by application name.
 static atomic_int gSortByApp = 0;
@@ -172,6 +178,7 @@ static NSMutableDictionary<NSString *, NSImage *> *gOverrideIconCache = nil;
 @property (nonatomic, strong) NSWindow      *settingsWindow;
 @property (nonatomic, strong) NSButton      *bootCheck;
 @property (nonatomic, strong) NSButton      *windowlessCheck;
+@property (nonatomic, strong) NSButton      *minimizedLastCheck;
 @property (nonatomic, strong) NSButton      *focusCheck;
 @property (nonatomic, strong) NSPopUpButton *hotkeyPopup;
 @property (nonatomic, strong) NSPopUpButton *delayPopup;
@@ -209,6 +216,7 @@ static const NSTimeInterval                        kThumbIdlePurgeAfter = 45.0; 
 // Forward declarations — these are used by the panel UI, which is defined
 // before the thumbnail-cache and MRU sections.
 static void gf_pushMRU(CGWindowID winID);
+static void gf_seedMRUTail(NSArray<NSNumber *> *ordered);
 static void gf_captureAsync(CGWindowID winID);
 static void gf_scheduleThumbPurge(void);
 static void gf_cancelThumbPurge(void);
@@ -361,6 +369,18 @@ int gf_frontmostPID(void) {
 // placeholder entry (unresponsive=1, axRef=NULL).
 static const float kAXAppTimeout = 0.1f; // seconds
 
+// zOrder bands. Smaller sorts closer to the front of the grid. Live windows
+// occupy 0..kMRUCap-1, one slot per MRU position — gf_seedMRUTail guarantees
+// every on-screen window has one. The rest get a band each, spaced far enough
+// apart that the within-band offset can never spill into the next one. Bands,
+// not ad-hoc constants, so that "is this ranked ahead of that" is answerable
+// by reading the list.
+static const int kZMinimized         = 200000; // minimized, MRU rank known
+static const int kZMinimizedUnranked = 300000; // minimized, never focused
+static const int kZOffscreen         = 400000; // live, not on this Space
+static const int kZWindowless        = 800000; // running app with no windows
+static const int kZUnresponsive      = 900000; // app that stopped answering AX
+
 static void gf_ensureCap(gf_window_t **buf, int *cap, int needed) {
     if (needed <= *cap) return;
     int newCap = *cap > 0 ? *cap : 32;
@@ -385,7 +405,6 @@ typedef struct {
     int            unresponsive;
     int            windowless;  // running regular app with no windows
     NSInteger      mruPos;      // NSNotFound if not in MRU
-    int            cgOrder;     // -1 if not in cgIndex (off-screen / minimized)
 } gf_pending_t;
 
 typedef struct {
@@ -417,7 +436,6 @@ static void gf_addWindowlessSlot(gf_slot_t *s, NSRunningApplication *app, pid_t 
     p->unresponsive = 0;
     p->windowless   = 1;
     p->mruPos       = NSNotFound;
-    p->cgOrder      = -1;
     s->count = 1;
 }
 
@@ -449,29 +467,57 @@ static CFArrayRef gf_copyWindowsFromChildren(AXUIElementRef axApp) {
     return out;
 }
 
+/*
+ * gf_onScreenWindows — snapshot the on-screen window stack, front to back.
+ *
+ * Layer-0 windows only, so menu bars, the Dock and other chrome stay out.
+ *
+ * Inputs:
+ *   out_index - when non-NULL, receives a winID -> front-to-back position
+ *               map (immutable, so workers can read it concurrently)
+ *
+ * Output:
+ *   front-to-back ordered CGWindowIDs, boxed. Never NULL; empty if the
+ *   window list could not be read.
+ */
+static NSArray<NSNumber *> *gf_onScreenWindows(
+        NSDictionary<NSNumber *, NSNumber *> **out_index) {
+    NSMutableArray<NSNumber *> *ordered = [NSMutableArray array];
+    NSMutableDictionary<NSNumber *, NSNumber *> *index = [NSMutableDictionary dictionary];
+    CFArrayRef cgList = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID);
+    if (cgList) {
+        CFIndex n = CFArrayGetCount(cgList);
+        for (CFIndex i = 0; i < n; i++) {
+            NSDictionary *info = (__bridge NSDictionary *)CFArrayGetValueAtIndex(cgList, i);
+            NSNumber *layer = info[(id)kCGWindowLayer];
+            if (layer.intValue != 0) continue;
+            NSNumber *wid = info[(id)kCGWindowNumber];
+            if (!wid || index[wid]) continue;
+            index[wid] = @((int)i);
+            [ordered addObject:wid];
+        }
+        CFRelease(cgList);
+    }
+    if (out_index) *out_index = [index copy];
+    return ordered;
+}
+
 gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
     *out_count = 0;
     @autoreleasepool {
         // CGWindowID -> front-to-back-index map for sort + on-screen test.
         // Built once on the calling thread, then read concurrently from
-        // workers. Copy to an immutable NSDictionary so concurrent reads
-        // are documented-safe.
-        NSMutableDictionary<NSNumber *, NSNumber *> *cgIndexM = [NSMutableDictionary dictionary];
-        CFArrayRef cgList = CGWindowListCopyWindowInfo(
-            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-            kCGNullWindowID);
-        if (cgList) {
-            CFIndex n = CFArrayGetCount(cgList);
-            for (CFIndex i = 0; i < n; i++) {
-                NSDictionary *info = (__bridge NSDictionary *)CFArrayGetValueAtIndex(cgList, i);
-                NSNumber *layer = info[(id)kCGWindowLayer];
-                if (layer.intValue != 0) continue;
-                NSNumber *wid = info[(id)kCGWindowNumber];
-                if (wid && !cgIndexM[wid]) cgIndexM[wid] = @((int)i);
-            }
-            CFRelease(cgList);
-        }
-        NSDictionary<NSNumber *, NSNumber *> *cgIndex = [cgIndexM copy];
+        // workers; the map is immutable, so those reads are documented-safe.
+        NSDictionary<NSNumber *, NSNumber *> *cgIndex = nil;
+        NSArray<NSNumber *> *onScreen = gf_onScreenWindows(&cgIndex);
+
+        // Record anything on screen the MRU has never seen before taking the
+        // snapshot below, so this pass already ranks it. Without this a window
+        // created after startup and never activated from another app is absent
+        // from the MRU entirely, and lands behind every stale entry in it.
+        gf_seedMRUTail(onScreen);
 
         // Snapshot MRU into a winID -> index dict so workers can do O(1)
         // lookups without touching the mutable gMRU array (which the main
@@ -551,7 +597,6 @@ gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
                     p->onScreen     = 1;
                     p->unresponsive = 1;
                     p->mruPos       = NSNotFound;
-                    p->cgOrder      = -1;
                     CFRelease(axApp);
                     return;
                 }
@@ -623,7 +668,6 @@ gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
                     p->unresponsive = 0;
                     p->windowless   = 0;
                     p->mruPos       = mruIdx ? (NSInteger)mruIdx.unsignedIntegerValue : NSNotFound;
-                    p->cgOrder      = order ? order.intValue : -1;
                     s->count++;
                 }
                 CFRelease(axWins);
@@ -656,20 +700,26 @@ gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
                 e->unresponsive = p->unresponsive;
                 e->windowless   = p->windowless;
 
+                // Minimized windows are sunk as a group when the preference
+                // is on, but keep their recency order within that group.
+                BOOL sinkMinimized = p->minimized && atomic_load(&gMinimizedLast);
+
                 int zOrder;
                 if (p->unresponsive) {
-                    zOrder = 900000 + fallbackZ;
+                    zOrder = kZUnresponsive + fallbackZ;
                 } else if (p->windowless) {
                     // After all real windows, before unresponsive apps.
-                    zOrder = 800000 + fallbackZ;
+                    zOrder = kZWindowless + fallbackZ;
+                } else if (sinkMinimized) {
+                    zOrder = (p->mruPos != NSNotFound)
+                           ? kZMinimized + (int)p->mruPos
+                           : kZMinimizedUnranked + fallbackZ;
                 } else if (p->mruPos != NSNotFound) {
                     zOrder = (int)p->mruPos;
-                } else if (p->cgOrder >= 0) {
-                    zOrder = 100000 + p->cgOrder;
                 } else if (p->minimized) {
-                    zOrder = 300000 + fallbackZ;
+                    zOrder = kZMinimizedUnranked + fallbackZ;
                 } else {
-                    zOrder = 200000 + fallbackZ;
+                    zOrder = kZOffscreen + fallbackZ;
                 }
                 e->zOrder = zOrder;
                 fallbackZ++;
@@ -2401,6 +2451,76 @@ static void gf_pushMRU(CGWindowID winID) {
     while (gMRU.count > kMRUCap) [gMRU removeLastObject];
 }
 
+/*
+ * gf_seedMRUTail — record on-screen windows the MRU has never seen.
+ *
+ * A window enters the MRU only by being focused, and the focus events that
+ * would do it are missed for an app that launches after go_fish: it activates
+ * before its first window exists, so the AX query comes back empty. Such a
+ * window is then absent from the list entirely and ranks behind every entry
+ * in it - including windows minimized hours ago, which are never demoted.
+ *
+ * Appending at the tail rather than the front is the point: "seen, but not
+ * recently used" is exactly true of a window we have no focus record for.
+ *
+ * No trim here. Appending can push the list past kMRUCap, and trimming from
+ * the tail would drop precisely what was just added; the next gf_pushMRU
+ * trims instead, from the least-recently-used end, which is correct.
+ *
+ * Inputs:
+ *   ordered - front-to-back on-screen window IDs, from gf_onScreenWindows
+ *
+ * Output:
+ *   none. Main thread only.
+ */
+static void gf_seedMRUTail(NSArray<NSNumber *> *ordered) {
+    if (!gMRU || ordered.count == 0) return;
+    NSSet<NSNumber *> *known = [NSSet setWithArray:gMRU];
+    for (NSNumber *wid in ordered) {
+        if (![known containsObject:wid]) [gMRU addObject:wid];
+    }
+}
+
+static CGWindowID gf_focusedWindowForPID(pid_t pid);
+
+// Activation-push retry schedule. An app that has just launched activates
+// before it has a window, so the first AX query returns nothing; these back
+// off across roughly nine seconds waiting for the window to appear.
+static const int    kActivationRetries   = 6;
+static const double kActivationRetryBase = 0.15;   // seconds; doubles per try
+
+/*
+ * gf_retryActivationPush — re-attempt the MRU push for a just-activated app.
+ *
+ * Inputs:
+ *   pid     - the app that activated
+ *   attempt - 0 on the first retry, incremented per reschedule
+ *
+ * Output:
+ *   none. Gives up after kActivationRetries, or as soon as the app stops
+ *   being frontmost - crediting a use the user never made would be worse
+ *   than missing one. Main thread only.
+ */
+static void gf_retryActivationPush(pid_t pid, int attempt) {
+    if (attempt >= kActivationRetries) return;
+    double delay = kActivationRetryBase * (double)(1 << attempt);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            NSRunningApplication *app = [NSRunningApplication
+                runningApplicationWithProcessIdentifier:pid];
+            if (!app || app.terminated || !app.active) return;
+            CGWindowID winID = gf_focusedWindowForPID(pid);
+            if (winID == 0) {
+                gf_retryActivationPush(pid, attempt + 1);
+                return;
+            }
+            gf_pushMRU(winID);
+            gf_captureAsync(winID);
+        }
+    });
+}
+
 // Resolve the currently focused window of an app (by pid) to a CGWindowID.
 static CGWindowID gf_focusedWindowForPID(pid_t pid) {
     AXUIElementRef axApp = AXUIElementCreateApplication(pid);
@@ -2437,7 +2557,29 @@ static void gf_axObserverCallback(AXObserverRef obs, AXUIElementRef element,
     }
 }
 
-static void gf_installObserverForPID(pid_t pid) {
+// Observer-install retry schedule. An app that has just launched is not yet
+// answering AX and fails the registration with kAXErrorCannotComplete; these
+// back off across roughly eight seconds waiting for it to come up.
+static const int    kObserverRetries   = 5;
+static const double kObserverRetryBase = 0.25;   // seconds; doubles per try
+
+/*
+ * gf_installObserverForPID — observe an app's focused-window changes.
+ *
+ * The registration is what keeps the MRU current when the user moves between
+ * windows of the same app, so a silent failure here costs that app its
+ * recency tracking for the life of the process: the pid would be recorded as
+ * installed and the guard below would refuse every later attempt. Failures
+ * therefore drop the observer and reschedule rather than caching it.
+ *
+ * Inputs:
+ *   pid     - the application to observe
+ *   attempt - 0 for a first install, incremented per retry
+ *
+ * Output:
+ *   none. Gives up after kObserverRetries. Main thread only.
+ */
+static void gf_installObserverForPID(pid_t pid, int attempt) {
     if (!gAXObservers || gAXObservers[@(pid)]) return;
     AXObserverRef observer = NULL;
     if (AXObserverCreate(pid, gf_axObserverCallback, &observer) != kAXErrorSuccess || !observer) {
@@ -2448,9 +2590,24 @@ static void gf_installObserverForPID(pid_t pid) {
         CFRelease(observer);
         return;
     }
-    // Best-effort: not every app accepts the observation (e.g. unresponsive apps).
-    AXObserverAddNotification(observer, axApp, kAXFocusedWindowChangedNotification, NULL);
+    AXError err = AXObserverAddNotification(
+        observer, axApp, kAXFocusedWindowChangedNotification, NULL);
     CFRelease(axApp);
+    if (err != kAXErrorSuccess) {
+        CFRelease(observer);
+        if (attempt + 1 >= kObserverRetries) return;
+        double delay = kObserverRetryBase * (double)(1 << attempt);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @autoreleasepool {
+                NSRunningApplication *app = [NSRunningApplication
+                    runningApplicationWithProcessIdentifier:pid];
+                if (!app || app.terminated) return;
+                gf_installObserverForPID(pid, attempt + 1);
+            }
+        });
+        return;
+    }
     CFRunLoopAddSource(CFRunLoopGetMain(),
                        AXObserverGetRunLoopSource(observer),
                        kCFRunLoopDefaultMode);
@@ -2500,8 +2657,14 @@ static void gf_pollSEI(void);
             gf_pushMRU(winID);
         }
         gf_captureAsync(winID);
+    } else {
+        // An app that has just launched activates before its first window
+        // exists, so the AX query above finds nothing. Dropping the
+        // activation here would leave the app out of the MRU until the user
+        // switched away and back to it; retry until the window shows up.
+        gf_retryActivationPush(pid, 0);
     }
-    gf_installObserverForPID(pid); // in case it's a freshly-regular app
+    gf_installObserverForPID(pid, 0); // in case it's a freshly-regular app
 
     // App activation is the dominant trigger for Secure Event Input
     // state changes — most SEI-holding apps assert it as part of
@@ -2514,7 +2677,7 @@ static void gf_pollSEI(void);
 - (void)appLaunched:(NSNotification *)note {
     NSRunningApplication *app = note.userInfo[NSWorkspaceApplicationKey];
     if (!app || app.activationPolicy != NSApplicationActivationPolicyRegular) return;
-    gf_installObserverForPID(app.processIdentifier);
+    gf_installObserverForPID(app.processIdentifier, 0);
 }
 
 - (void)appTerminated:(NSNotification *)note {
@@ -2546,22 +2709,10 @@ static void gf_setupMRUTracking(void) {
     // reasonable list even before any focus event has fired.
     for (NSRunningApplication *app in [[NSWorkspace sharedWorkspace] runningApplications]) {
         if (app.activationPolicy == NSApplicationActivationPolicyRegular) {
-            gf_installObserverForPID(app.processIdentifier);
+            gf_installObserverForPID(app.processIdentifier, 0);
         }
     }
-    CFArrayRef cgList = CGWindowListCopyWindowInfo(
-        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-        kCGNullWindowID);
-    if (cgList) {
-        CFIndex n = CFArrayGetCount(cgList);
-        for (CFIndex i = 0; i < n; i++) {
-            NSDictionary *info = (__bridge NSDictionary *)CFArrayGetValueAtIndex(cgList, i);
-            if ([info[(id)kCGWindowLayer] intValue] != 0) continue;
-            NSNumber *wid = info[(id)kCGWindowNumber];
-            if (wid && ![gMRU containsObject:wid]) [gMRU addObject:wid];
-        }
-        CFRelease(cgList);
-    }
+    gf_seedMRUTail(gf_onScreenWindows(NULL));
 
     // Pre-warm the thumbnail cache for the windows visible at launch.
     gf_bootstrapCapture();
@@ -2934,6 +3085,8 @@ static void gf_stopSEITimer(void) {
         ? NSControlStateValueOn : NSControlStateValueOff;
     self.windowlessCheck.state = atomic_load(&gShowWindowlessApps)
         ? NSControlStateValueOn : NSControlStateValueOff;
+    self.minimizedLastCheck.state = atomic_load(&gMinimizedLast)
+        ? NSControlStateValueOn : NSControlStateValueOff;
     self.focusCheck.state = atomic_load(&gShowFocusButton)
         ? NSControlStateValueOn : NSControlStateValueOff;
     self.seiCheck.state = atomic_load(&gSEIDetection)
@@ -2982,6 +3135,7 @@ static void gf_stopSEITimer(void) {
     CGFloat delayY      = y; y += 24 + 8;
     CGFloat hotkeyY     = y; y += 24 + 8;
     CGFloat focusY      = y; y += 22 + 8;
+    CGFloat minLastY    = y; y += 22 + 8;
     CGFloat windowlessY = y; y += 22 + 8;
     CGFloat behLabelY   = y; y += 16 + 10;
     CGFloat sep1Y       = y; y += 1  + 12;
@@ -3050,6 +3204,8 @@ static void gf_stopSEITimer(void) {
     addSectionLabel(@"BEHAVIOR", behLabelY);
     self.windowlessCheck = addCheck(@"Show apps without windows",
                                     windowlessY, @selector(toggleWindowless:));
+    self.minimizedLastCheck = addCheck(@"Show minimized windows last in the grid",
+                                       minLastY, @selector(toggleMinimizedLast:));
     self.focusCheck = addCheck(@"Show cascade button in grid",
                                focusY, @selector(toggleFocusButton:));
     self.hotkeyPopup = addPopupRow(@"Hotkey:",
@@ -3292,6 +3448,13 @@ static void gf_stopSEITimer(void) {
                                             forKey:@"ShowWindowlessApps"];
 }
 
+- (void)toggleMinimizedLast:(NSButton *)sender {
+    int next = (sender.state == NSControlStateValueOn) ? 1 : 0;
+    atomic_store(&gMinimizedLast, next);
+    [[NSUserDefaults standardUserDefaults] setBool:(next ? YES : NO)
+                                            forKey:@"MinimizedLast"];
+}
+
 - (void)toggleFocusButton:(NSButton *)sender {
     int next = (sender.state == NSControlStateValueOn) ? 1 : 0;
     atomic_store(&gShowFocusButton, next);
@@ -3346,6 +3509,7 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     [defaults registerDefaults:@{@"SEIDetection": @YES,
                                  @"ShowWindowlessApps": @NO,
+                                 @"MinimizedLast": @YES,
                                  @"ShowFocusButton": @YES,
                                  @"HotkeyModifier": @0,
                                  @"QuickSwitchDelayMs": @100,
@@ -3357,6 +3521,8 @@ static void installStatusItem(const void *iconBytes, int iconLen) {
     gf_reloadOverrideRules();
     atomic_store(&gShowWindowlessApps,
                  [defaults boolForKey:@"ShowWindowlessApps"] ? 1 : 0);
+    atomic_store(&gMinimizedLast,
+                 [defaults boolForKey:@"MinimizedLast"] ? 1 : 0);
     atomic_store(&gShowFocusButton,
                  [defaults boolForKey:@"ShowFocusButton"] ? 1 : 0);
     atomic_store(&gHotkeyModifier, (int)[defaults integerForKey:@"HotkeyModifier"]);
