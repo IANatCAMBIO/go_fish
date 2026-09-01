@@ -92,6 +92,20 @@ static atomic_int gShowFocusButton = 1;
 // and lets the already-queued gfOnCommit activate the window silently.
 static atomic_int gQuickSwitch = 0;
 
+// Uptime, in nanoseconds, of the most recent hotkey press. A modifier release
+// only counts as a quick switch if it lands inside the quick-switch delay
+// window opened by that press. Without this bound, gQuickSwitch latched on any
+// modifier release at all — a Shift tap while typing was enough — and stayed
+// latched until the next hotkey press, so the very next "Show Window Grid"
+// from the menu was silently swallowed by the skip branch in gf_showPanel.
+static atomic_ullong gHotkeyPressNs = 0;
+
+// Monotonic nanoseconds; unaffected by wall-clock changes, and does not
+// advance while the machine is asleep.
+static uint64_t gf_nowNs(void) {
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
 // Eager-push guard: when gf_activateWindow pushes a winID to the MRU front
 // before the OS activation completes, appActivated: may fire shortly after
 // and overwrite it with a stale AX focused-window result. We record the
@@ -231,13 +245,18 @@ static CGEventRef tapCallback(CGEventTapProxy proxy, CGEventType type,
             // ~100 ms of AX window enumeration; calling it synchronously here
             // causes kCGEventTapDisabledByTimeout at the HID level and the
             // event slips through to the system switcher before we can consume it.
+            // Reset here, in the tap callback, not in the dispatched block: a
+            // modifier release arriving before that block runs is exactly the
+            // quick switch we need to catch.
             atomic_store(&gQuickSwitch, 0); // reset — new key sequence starting
+            atomic_store(&gHotkeyPressNs, gf_nowNs());
             int s = shift ? 1 : 0;
             dispatch_async(dispatch_get_main_queue(), ^{ gfOnHotkey(s, 0); });
             return NULL;
         }
         if (modDown && key == 0x32 /* ` (grave) */) {
             atomic_store(&gQuickSwitch, 0);
+            atomic_store(&gHotkeyPressNs, gf_nowNs());
             int s = shift ? 1 : 0;
             dispatch_async(dispatch_get_main_queue(), ^{ gfOnHotkey(s, 1); });
             return NULL;
@@ -248,10 +267,21 @@ static CGEventRef tapCallback(CGEventTapProxy proxy, CGEventType type,
         }
     } else if (type == kCGEventFlagsChanged) {
         if (!modDown) {
-            // If the modifier is released before the panel has opened (gActive
-            // still 0), mark this as a quick switch. gf_showPanel will skip the
-            // grid; the gfOnCommit dispatched below activates the window silently.
-            if (!atomic_load(&gActive)) {
+            // If the hotkey modifier is released before the panel has opened
+            // (gActive still 0), mark this as a quick switch. gf_showPanel will
+            // skip the grid; the gfOnCommit dispatched below activates the
+            // window silently.
+            //
+            // Only a release that lands inside the pending press's delay window
+            // counts. Every modifier release reaches this branch — modDown
+            // tracks the hotkey modifier alone, so releasing Shift after typing
+            // a capital letter arrives here too — and latching on those left
+            // the flag set indefinitely.
+            uint64_t pressed = atomic_load(&gHotkeyPressNs);
+            uint64_t window  = (uint64_t)atomic_load(&gQuickSwitchDelayMs)
+                               * NSEC_PER_MSEC;
+            if (!atomic_load(&gActive) && pressed &&
+                gf_nowNs() - pressed <= window) {
                 atomic_store(&gQuickSwitch, 1);
             }
             dispatch_async(dispatch_get_main_queue(), ^{ gfOnCommit(); });
@@ -363,6 +393,34 @@ static void gf_addWindowlessSlot(gf_slot_t *s, NSRunningApplication *app, pid_t 
     s->count = 1;
 }
 
+// Some apps never populate kAXWindowsAttribute. Finder is the notable one: the
+// attribute exists and reads back as an empty array (err=0, count=0) even with
+// live, focused, non-minimized windows — the real windows are only reachable as
+// AXWindow-role children of the application element. Filtering AXChildren down
+// to windows recovers them. Returns a +1 array, or NULL if the app genuinely
+// has no windows.
+static CFArrayRef gf_copyWindowsFromChildren(AXUIElementRef axApp) {
+    CFTypeRef kids = NULL;
+    if (AXUIElementCopyAttributeValue(axApp, kAXChildrenAttribute, &kids)
+            != kAXErrorSuccess || !kids) return NULL;
+    CFMutableArrayRef out =
+        CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+    CFIndex n = CFArrayGetCount((CFArrayRef)kids);
+    for (CFIndex i = 0; i < n; i++) {
+        AXUIElementRef c =
+            (AXUIElementRef)CFArrayGetValueAtIndex((CFArrayRef)kids, i);
+        CFTypeRef roleRef = NULL;
+        AXUIElementCopyAttributeValue(c, kAXRoleAttribute, &roleRef);
+        NSString *role = (__bridge_transfer NSString *)roleRef;
+        // AXMenuBar and AXFunctionRowTopLevelElement also live under AXChildren.
+        if ([role isEqualToString:(NSString *)kAXWindowRole])
+            CFArrayAppendValue(out, c);
+    }
+    CFRelease(kids);
+    if (CFArrayGetCount(out) == 0) { CFRelease(out); return NULL; }
+    return out;
+}
+
 gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
     *out_count = 0;
     @autoreleasepool {
@@ -469,10 +527,17 @@ gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
                     CFRelease(axApp);
                     return;
                 }
-                if (err != kAXErrorSuccess || !axWins) {
-                    // Responsive, but reports no windows attribute at all.
-                    if (wantWindowless) gf_addWindowlessSlot(s, app, pid);
+                // An empty or missing AXWindows list does not mean the app
+                // is windowless — see gf_copyWindowsFromChildren. Retry via
+                // AXChildren before concluding there is nothing to show.
+                if (err != kAXErrorSuccess || !axWins ||
+                    CFArrayGetCount(axWins) == 0) {
                     if (axWins) CFRelease(axWins);
+                    axWins = gf_copyWindowsFromChildren(axApp);
+                }
+                if (!axWins) {
+                    // Responsive, and genuinely reports no windows.
+                    if (wantWindowless) gf_addWindowlessSlot(s, app, pid);
                     CFRelease(axApp);
                     return;
                 }
@@ -1499,6 +1564,131 @@ void gf_minimizeAll(void) {
     });
 }
 
+// =========================================================================
+// Bulk window placement (cascade / focus)
+// =========================================================================
+
+// Placement writes go to the window element, not the application element:
+// AXUIElementSetMessagingTimeout applies only to the object it is called on
+// ("not for other accessibility objects that are equal to it"), so the old
+// code — which created a throwaway AXUIElementCreateApplication ref, set 2.0s
+// on it, and released it — never actually raised the timeout on anything we
+// wrote to. Placement is user-initiated and can afford to wait: a busy app
+// (Firefox mid-render, Electron on a heavy page) needs far longer than the
+// 0.1s enumeration budget to service a resize.
+static const float kAXPlaceTimeout = 2.0f;      // seconds
+
+// A frame has landed when both axes are within this many points of target.
+// Apps routinely round to their own content grid (Terminal snaps to character
+// cells), so an exact match is not a reachable goal.
+static const CGFloat kPlaceTolerance = 2.0;
+
+// Write / read-back / rewrite budget per window. Converged windows return on
+// the first or second attempt; the backoff only gets paid by windows that are
+// still settling.
+static const int        kPlaceAttempts  = 6;
+static const useconds_t kPlaceSettleUS  = 50 * 1000;
+
+// How long to wait for an animated state change (un-minimize, full-screen
+// exit) to finish. A full-screen exit is a Space transition and is the slow
+// one, at roughly a second.
+static const useconds_t kPlaceTransitionUS = 1500 * 1000;
+
+// Z-order sweep: how long to wait for a pending app activation to land, the
+// gap between individual raises, and how many times to re-sweep if the stack
+// still reads back wrong. See gf_restoreZOrder.
+static const useconds_t kRaiseActivateUS = 800 * 1000;
+static const useconds_t kRaiseStepUS     =  25 * 1000;
+static const int        kRaisePasses     = 3;
+
+// Serial queue for the placement loop. It must not run on the main queue: it
+// sleeps between retries and issues synchronous AX round-trips that can each
+// take hundreds of milliseconds. Serial so two cascades fired in quick
+// succession queue up instead of interleaving AX writes to the same windows.
+static dispatch_queue_t gf_placeQueue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.gofish.place", DISPATCH_QUEUE_SERIAL);
+    });
+    return q;
+}
+
+// Cascade staircase parameters. Computed once on the main thread (NSScreen and
+// NSEvent are main-thread affine) and consumed by the placement worker.
+typedef struct {
+    CGFloat startX, startY;   // AX-space top-left of the target visible area
+    CGFloat offset;           // per-step diagonal shift
+    int     maxStep;          // steps before the staircase wraps
+    CGSize  size;             // uniform window size
+} gf_cascade_geom_t;
+
+// One window queued for placement. Built on the main thread from the
+// enumeration snapshot (which is freed immediately afterwards), handed to the
+// placement queue, then to the completion block, which owns and frees it.
+typedef struct {
+    AXUIElementRef ax;          // retained +1
+    pid_t          pid;
+    CGWindowID     wid;         // 0 if unknown; used to verify the final stack
+    int            minimized;   // was minimized at enumeration time
+    char          *label;       // malloc'd "App — Title", for diagnostics
+} gf_place_item_t;
+
+/*
+ * gf_cascadeGeometry — staircase parameters for the screen under the mouse.
+ *
+ * Output:
+ *   Parameters in AX coordinates: y-down with the origin at the primary
+ *   screen's top-left, converted from AppKit's y-up bottom-left space.
+ *
+ * Must be called on the main thread.
+ */
+static gf_cascade_geom_t gf_cascadeGeometry(void) {
+    NSPoint cursor = [NSEvent mouseLocation];
+    NSScreen *screen = [NSScreen mainScreen];
+    for (NSScreen *s in [NSScreen screens]) {
+        if (NSPointInRect(cursor, s.frame)) { screen = s; break; }
+    }
+    NSRect vf = screen.visibleFrame;
+
+    // The AX-primary screen is the one whose AppKit origin is (0,0) — not
+    // necessarily firstObject, especially after a monitor change.
+    CGFloat primaryH = [NSScreen mainScreen].frame.size.height;
+    for (NSScreen *ps in [NSScreen screens])
+        if (ps.frame.origin.x == 0.0 && ps.frame.origin.y == 0.0)
+            { primaryH = ps.frame.size.height; break; }
+
+    gf_cascade_geom_t g;
+    g.startX = vf.origin.x;
+    g.startY = primaryH - (vf.origin.y + vf.size.height);
+    g.offset = 32.0;
+    // Wrap the staircase before it pushes windows off the visible area,
+    // leaving ~300pt of vertical room for the trailing window's content.
+    CGFloat budget = MAX(vf.size.height - 300.0, g.offset * 2);
+    g.maxStep = MAX(1, (int)(budget / g.offset));
+    // Uniform target size: 75% of the visible area, clamped so windows aren't
+    // huge on big displays or unusable on small ones.
+    g.size.width  = MIN(MAX(vf.size.width  * 0.75, 480.0), 1600.0);
+    g.size.height = MIN(MAX(vf.size.height * 0.75, 320.0), 1000.0);
+    return g;
+}
+
+/*
+ * gf_cascadeRect — target frame for one rung of the staircase.
+ *
+ * Inputs:
+ *   g    — staircase parameters, must not be NULL
+ *   step — rung index; wraps at g->maxStep
+ *
+ * Output:
+ *   The target frame in AX coordinates.
+ */
+static CGRect gf_cascadeRect(const gf_cascade_geom_t *g, int step) {
+    int s = step % g->maxStep;
+    return CGRectMake(g->startX + g->offset * s, g->startY + g->offset * s,
+                      g->size.width, g->size.height);
+}
+
 // Best-effort un-fullscreen. Some apps expose kAXFullScreenAttribute and let
 // us toggle it; if they do and the window is full-screen, flip it back to
 // windowed so the subsequent position-set has a chance of taking effect.
@@ -1516,226 +1706,433 @@ static BOOL gf_isFullScreen(AXUIElementRef ax) {
     return out;
 }
 
+/*
+ * gf_setBoolAttrAndWait — write a boolean AX attribute and wait for the app to
+ * report the new value.
+ *
+ * Un-minimizing and leaving full screen are animated, and
+ * AXUIElementSetAttributeValue returns as soon as the app accepts the message,
+ * not when the transition has finished. Geometry written into that gap is
+ * wasted: the restore animation completes afterwards and puts the window back
+ * at its pre-minimize frame.
+ *
+ * Inputs:
+ *   ax        — window element, must not be NULL
+ *   attr      — boolean attribute to write
+ *   desired   — value to write and then wait for
+ *   timeoutUS — give up after this long
+ *
+ * Output:
+ *   YES if the attribute read back as desired. NO on timeout, or if the app
+ *   does not expose the attribute — in both cases the caller should carry on.
+ *
+ * Must not be called on the main thread: it sleeps.
+ */
+static BOOL gf_setBoolAttrAndWait(AXUIElementRef ax, CFStringRef attr,
+                                  BOOL desired, useconds_t timeoutUS) {
+    AXUIElementSetAttributeValue(ax, attr,
+        desired ? kCFBooleanTrue : kCFBooleanFalse);
+
+    const useconds_t stepUS = 40 * 1000;
+    for (useconds_t waited = 0; waited <= timeoutUS; waited += stepUS) {
+        CFTypeRef v = NULL;
+        if (AXUIElementCopyAttributeValue(ax, attr, &v) != kAXErrorSuccess || !v)
+            return NO;                  // unsupported — nothing to wait for
+        BOOL now = (CFGetTypeID(v) == CFBooleanGetTypeID())
+                   ? CFBooleanGetValue((CFBooleanRef)v) : NO;
+        CFRelease(v);
+        if (now == desired) return YES;
+        usleep(stepUS);
+    }
+    return NO;
+}
+
+/*
+ * gf_readFrame — read a window's current AX position and size.
+ *
+ * Inputs:
+ *   ax  — window element, must not be NULL
+ *   out — receives the frame in AX coordinates on success, must not be NULL
+ *
+ * Output:
+ *   YES if both attributes were read, NO otherwise (*out left untouched).
+ */
+static BOOL gf_readFrame(AXUIElementRef ax, CGRect *out) {
+    CFTypeRef posRef = NULL, szRef = NULL;
+    AXUIElementCopyAttributeValue(ax, kAXPositionAttribute, &posRef);
+    AXUIElementCopyAttributeValue(ax, kAXSizeAttribute, &szRef);
+
+    BOOL ok = NO;
+    CGPoint pt; CGSize sz;
+    if (posRef && szRef &&
+        CFGetTypeID(posRef) == AXValueGetTypeID() &&
+        CFGetTypeID(szRef)  == AXValueGetTypeID() &&
+        AXValueGetValue((AXValueRef)posRef, kAXValueCGPointType, &pt) &&
+        AXValueGetValue((AXValueRef)szRef,  kAXValueCGSizeType,  &sz)) {
+        *out = CGRectMake(pt.x, pt.y, sz.width, sz.height);
+        ok = YES;
+    }
+    if (posRef) CFRelease(posRef);
+    if (szRef)  CFRelease(szRef);
+    return ok;
+}
+
+/*
+ * gf_placeWindow — force one window to a target frame, tolerating apps that
+ * apply AX geometry writes asynchronously.
+ *
+ * A single size-then-position pass is not reliable, which is why the first
+ * cascade misplaces windows and an immediate second cascade looks perfect —
+ * the second run starts from windows that have already settled. Three things
+ * go wrong on the first pass:
+ *
+ *   - kAXSize returns when the app accepts the message, not when the frame has
+ *     actually changed. A window still at its old, oversized frame when the
+ *     position write lands has that position clamped by the WindowServer to
+ *     keep the window on screen, so it never reaches the cascade origin.
+ *   - A window that was just un-minimized or taken out of full screen finishes
+ *     its restore animation after our writes and overwrites them.
+ *   - Apps that resize on their own run loop (Electron/Chromium, JetBrains)
+ *     acknowledge the write well before the frame changes.
+ *
+ * So write, read back, and rewrite until the frame sticks.
+ *
+ * Inputs:
+ *   ax     — window element with the placement messaging timeout already
+ *            applied (see gf_runPlacement); must not be NULL
+ *   target — desired frame in AX coordinates
+ *   label  — "App — Title" for diagnostics, may be NULL
+ *
+ * Output:
+ *   YES once the origin sits within kPlaceTolerance of target. NO if position
+ *   is not settable or the frame never converged. Size is best-effort: a
+ *   window with a fixed or clamped size still counts as placed once its origin
+ *   lands and its size stops changing.
+ *
+ * Must not be called on the main thread: it sleeps between attempts.
+ */
+static BOOL gf_placeWindow(AXUIElementRef ax, CGRect target, const char *label) {
+    Boolean posSettable = false;
+    AXError serr = AXUIElementIsAttributeSettable(ax, kAXPositionAttribute,
+                                                  &posSettable);
+    if (serr != kAXErrorSuccess || !posSettable) {
+        fprintf(stderr,
+            "go_fish cascade: skipping \"%s\" — position not settable (err=%d settable=%d)\n",
+            label ?: "", (int)serr, (int)posSettable);
+        return NO;
+    }
+    Boolean szSettable = false;
+    AXError szerr = AXUIElementIsAttributeSettable(ax, kAXSizeAttribute,
+                                                   &szSettable);
+    if (szerr != kAXErrorSuccess || !szSettable) {
+        fprintf(stderr,
+            "go_fish cascade: size not settable for \"%s\" (err=%d settable=%d)\n",
+            label ?: "", (int)szerr, (int)szSettable);
+    }
+
+    CGSize lastSize = CGSizeMake(-1.0, -1.0);
+    for (int attempt = 0; attempt < kPlaceAttempts; attempt++) {
+        // Size first: shrinking before the move keeps an oversized window from
+        // having its new position clamped back onto the screen.
+        if (szSettable) {
+            CGSize sz = target.size;
+            AXValueRef v = AXValueCreate(kAXValueCGSizeType, &sz);
+            if (v) {
+                AXUIElementSetAttributeValue(ax, kAXSizeAttribute, v);
+                CFRelease(v);
+            }
+        }
+        CGPoint pt = target.origin;
+        AXValueRef pv = AXValueCreate(kAXValueCGPointType, &pt);
+        if (!pv) return NO;
+        AXError perr = AXUIElementSetAttributeValue(ax, kAXPositionAttribute, pv);
+        CFRelease(pv);
+        if (perr != kAXErrorSuccess) {
+            fprintf(stderr,
+                "go_fish cascade: failed to move \"%s\" — AXError=%d\n",
+                label ?: "", (int)perr);
+            return NO;
+        }
+
+        CGRect now;
+        if (gf_readFrame(ax, &now)) {
+            BOOL originOK =
+                fabs(now.origin.x - target.origin.x) <= kPlaceTolerance &&
+                fabs(now.origin.y - target.origin.y) <= kPlaceTolerance;
+            // The app has the final say on size: a fixed-size window, or one
+            // whose minimum exceeds our target, reports the same wrong size
+            // every attempt. Once it stops changing, take it as final.
+            BOOL sizeOK =
+                (fabs(now.size.width  - target.size.width)  <= kPlaceTolerance &&
+                 fabs(now.size.height - target.size.height) <= kPlaceTolerance) ||
+                (fabs(now.size.width  - lastSize.width)  <= kPlaceTolerance &&
+                 fabs(now.size.height - lastSize.height) <= kPlaceTolerance);
+            if (originOK && sizeOK) return YES;
+            lastSize = now.size;
+        }
+        usleep(kPlaceSettleUS * (attempt + 1));
+    }
+
+    fprintf(stderr,
+        "go_fish cascade: \"%s\" never settled at %.0f,%.0f %.0fx%.0f\n",
+        label ?: "", target.origin.x, target.origin.y,
+        target.size.width, target.size.height);
+    return NO;
+}
+
+/*
+ * gf_freePlaceItems — release a placement list and everything it owns.
+ *
+ * Inputs:
+ *   items — list to free, may be NULL
+ *   count — number of entries
+ */
+static void gf_freePlaceItems(gf_place_item_t *items, int count) {
+    if (!items) return;
+    for (int i = 0; i < count; i++) {
+        if (items[i].ax) CFRelease(items[i].ax);
+        free(items[i].label);
+    }
+    free(items);
+}
+
+/*
+ * gf_appendPlaceItem — add one enumerated window to a placement list.
+ *
+ * Inputs:
+ *   items — list with room for at least *count + 1 entries
+ *   count — current length, incremented on success
+ *   w     — the enumeration entry to copy from (its axRef is retained and its
+ *           strings are duplicated, so w can be freed straight afterwards)
+ */
+static void gf_appendPlaceItem(gf_place_item_t *items, int *count,
+                               const gf_window_t *w) {
+    gf_place_item_t *it = &items[*count];
+    it->ax        = (AXUIElementRef)CFRetain((CFTypeRef)w->axRef);
+    it->pid       = (pid_t)w->pid;
+    it->wid       = (CGWindowID)w->windowID;
+    it->minimized = w->minimized;
+    it->label     = NULL;
+    asprintf(&it->label, "%s — %s", w->appName ?: "", w->title ?: "");
+    (*count)++;
+}
+
+/*
+ * gf_runPlacement — cascade a prepared list of windows off the main thread.
+ *
+ * Inputs:
+ *   items      — placement list in back-to-front order, must not be NULL
+ *   count      — number of entries, must be > 0
+ *   g          — staircase parameters from gf_cascadeGeometry
+ *   completion — run on the main thread once every window has been placed;
+ *                takes ownership of items and must free it (normally via
+ *                gf_freePlaceItems, or gf_restoreZOrder which ends by calling
+ *                it)
+ *
+ * Output:
+ *   None. Returns immediately; the work runs on gf_placeQueue.
+ */
+static void gf_runPlacement(gf_place_item_t *items, int count,
+                            gf_cascade_geom_t g,
+                            void (^completion)(gf_place_item_t *, int)) {
+    dispatch_async(gf_placeQueue(), ^{
+        @autoreleasepool {
+            // step advances only for windows that actually landed, so windows
+            // we failed to place don't leave gaps in the staircase.
+            int placed = 0, step = 0;
+            for (int i = 0; i < count; i++) {
+                AXUIElementRef ax = items[i].ax;
+                AXUIElementSetMessagingTimeout(ax, kAXPlaceTimeout);
+
+                // Let any animated state change finish before writing
+                // geometry — a restore that completes afterwards undoes it.
+                if (items[i].minimized) {
+                    gf_setBoolAttrAndWait(ax, kAXMinimizedAttribute, NO,
+                                          kPlaceTransitionUS);
+                }
+                if (gf_isFullScreen(ax)) {
+                    gf_setBoolAttrAndWait(ax, CFSTR("AXFullScreen"), NO,
+                                          kPlaceTransitionUS);
+                }
+
+                if (gf_placeWindow(ax, gf_cascadeRect(&g, step), items[i].label)) {
+                    step++;
+                    placed++;
+                }
+            }
+            fprintf(stderr,
+                    "go_fish cascade: placed %d of %d (target %.0fx%.0f)\n",
+                    placed, count, g.size.width, g.size.height);
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(items, count);
+            });
+        }
+    });
+}
+
+/*
+ * gf_waitForFrontmost — block until pid owns the active app.
+ *
+ * Inputs:
+ *   pid       — process expected to be frontmost
+ *   timeoutUS — give up after this long and let the caller proceed anyway
+ *
+ * Output:
+ *   YES if pid became frontmost, NO on timeout.
+ *
+ * Must not be called on the main thread: it sleeps.
+ */
+static BOOL gf_waitForFrontmost(pid_t pid, useconds_t timeoutUS) {
+    const useconds_t stepUS = 25 * 1000;
+    for (useconds_t waited = 0; waited <= timeoutUS; waited += stepUS) {
+        @autoreleasepool {
+            NSRunningApplication *front =
+                [NSWorkspace sharedWorkspace].frontmostApplication;
+            if (front && front.processIdentifier == pid) return YES;
+        }
+        usleep(stepUS);
+    }
+    return NO;
+}
+
+/*
+ * gf_zOrderCorrect — check the live window stack against the intended order.
+ *
+ * Reads the WindowServer's own front-to-back list rather than trusting that
+ * our raises took effect, and confirms that our windows are encountered in
+ * descending items[] order (items[] is back-to-front). Only the relative order
+ * of our own windows is checked: other apps' windows may be interleaved, and a
+ * window of ours that is missing from the live stack — one that never came
+ * back from minimized, say — is skipped rather than failed, so an unplaceable
+ * window can't make the sweep re-run forever.
+ *
+ * Inputs:
+ *   items — placement list in back-to-front order, must not be NULL
+ *   count — number of entries
+ *
+ * Output:
+ *   YES if the order holds, or if the stack could not be read (in which case
+ *   there is nothing to act on).
+ */
+static BOOL gf_zOrderCorrect(gf_place_item_t *items, int count) {
+    CFArrayRef list = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID);
+    if (!list) return YES;
+
+    int prev = count;                       // last index seen, front to back
+    BOOL ok = YES;
+    CFIndex n = CFArrayGetCount(list);
+    for (CFIndex i = 0; i < n && ok; i++) {
+        NSDictionary *info =
+            (__bridge NSDictionary *)CFArrayGetValueAtIndex(list, i);
+        if ([info[(id)kCGWindowLayer] intValue] != 0) continue;
+        CGWindowID wid = (CGWindowID)[info[(id)kCGWindowNumber] intValue];
+
+        for (int k = 0; k < count; k++) {
+            if (!items[k].wid || items[k].wid != wid) continue;
+            if (k >= prev) ok = NO;         // rose above a window it sits under
+            prev = k;
+            break;
+        }
+    }
+    CFRelease(list);
+    return ok;
+}
+
+/*
+ * gf_restoreZOrder — re-stack the placed windows back-to-front so the cascade
+ * ends with the original frontmost window on top.
+ *
+ * Un-minimizing, leaving full screen, and (on some apps) the position write
+ * itself raise a window in the global z-stack, so the original order does not
+ * survive the placement pass.
+ *
+ * Activation is the subtle part, and it must be kept strictly away from the
+ * sweep. Activating an app raises *every* window that app owns above every
+ * other app's, as a block. An activation that lands in the middle of the sweep
+ * therefore hoists windows we already stacked near the bottom up to join their
+ * siblings — measured: with the activation 120ms before the sweep, Firefox's
+ * four windows came out contiguous at the top and the one that belonged
+ * second-from-bottom sat four slots too high, while every other app was
+ * correctly interleaved. Activation is asynchronous and Firefox took longer
+ * than the head start it was given.
+ *
+ * So the owning app is activated once, before placement even starts (see
+ * gf_cascadeAll), which buys the whole placement pass as slack; this function
+ * additionally waits for it to actually be frontmost before touching anything.
+ * The stack is then built with kAXRaiseAction alone, which orders a window
+ * globally without activating its app.
+ *
+ * Per step, the target window is nominated as the app's main window BEFORE the
+ * raise: kAXRaiseAction is unreliable on Electron/Chromium (it raises whatever
+ * the app already considers main, not the element passed), and
+ * kAXMainAttribute pins it explicitly.
+ *
+ * Inputs:
+ *   items — placement list in back-to-front order; ownership is taken and the
+ *           list is freed once the sweep finishes
+ *   count — number of entries
+ *
+ * Must be called on the main thread.
+ */
+static void gf_restoreZOrder(gf_place_item_t *items, int count) {
+    if (count <= 0) { gf_freePlaceItems(items, count); return; }
+
+    dispatch_async(gf_placeQueue(), ^{
+        gf_waitForFrontmost(items[count - 1].pid, kRaiseActivateUS);
+
+        // Sweep, verify, re-sweep. An app that re-orders its own windows on
+        // its run loop can still land a group raise just after we passed it,
+        // and the only way to know is to read the stack back.
+        for (int pass = 0; pass < kRaisePasses; pass++) {
+            for (int i = 0; i < count; i++) {
+                @autoreleasepool {
+                    AXUIElementSetAttributeValue(items[i].ax, kAXMainAttribute,
+                                                 kCFBooleanTrue);
+                    AXUIElementPerformAction(items[i].ax, kAXRaiseAction);
+                }
+                // Pace the raises: WindowServer applies them in call order,
+                // but back-to-back raises leave apps that re-order on their
+                // own run loop racing our next one.
+                usleep(kRaiseStepUS);
+            }
+            if (gf_zOrderCorrect(items, count)) break;
+            fprintf(stderr, "go_fish cascade: z-order wrong after pass %d, "
+                            "re-stacking\n", pass + 1);
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            gf_freePlaceItems(items, count);
+        });
+    });
+}
+
 void gf_cascadeAll(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             int n = 0;
             gf_window_t *w = gf_enumerateWindows(&n, 0);
             if (!w) return;
-            // Front-to-back, so the first iteration ends up at the cascade
-            // origin and later windows tuck behind it.
+            // Front-to-back, so the staircase can be walked in reverse below.
             qsort(w, n, sizeof(gf_window_t), gf_cmpZOrder);
 
-            // Cascade onto the screen under the mouse.
-            NSPoint cursor = [NSEvent mouseLocation];
-            NSScreen *screen = [NSScreen mainScreen];
-            for (NSScreen *s in [NSScreen screens]) {
-                if (NSPointInRect(cursor, s.frame)) { screen = s; break; }
-            }
-            NSRect vf = screen.visibleFrame;
+            gf_cascade_geom_t g = gf_cascadeGeometry();
 
-            // AX uses a y-down coordinate space with origin at the primary
-            // screen's top-left; AppKit uses y-up with origin at the primary
-            // screen's bottom-left. Convert vf's top-left into AX space.
-            // The AX-primary screen is the one whose AppKit origin is (0,0) —
-            // not necessarily firstObject, especially after a monitor change.
-            CGFloat primaryH = [NSScreen mainScreen].frame.size.height;
-            for (NSScreen *ps in [NSScreen screens])
-                if (ps.frame.origin.x == 0.0 && ps.frame.origin.y == 0.0)
-                    { primaryH = ps.frame.size.height; break; }
-            CGFloat axStartX = vf.origin.x;
-            CGFloat axStartY = primaryH - (vf.origin.y + vf.size.height);
-
-            CGFloat offset  = 32.0;
-            // Wrap the staircase when it would push windows off the visible
-            // area, leaving ~300pt of vertical room for the trailing window's
-            // content to remain visible.
-            CGFloat budget  = MAX(vf.size.height - 300.0, offset * 2);
-            int     maxStep = MAX(1, (int)(budget / offset));
-
-            // Uniform target size: 75% of the visible area, clamped to
-            // sensible bounds so windows aren't huge on big displays or
-            // unusable on small ones.
-            CGFloat targetW = vf.size.width  * 0.75;
-            CGFloat targetH = vf.size.height * 0.75;
-            if (targetW > 1600) targetW = 1600;
-            if (targetH > 1000) targetH = 1000;
-            if (targetW < 480)  targetW = 480;
-            if (targetH < 320)  targetH = 320;
-
-            // Cascade is user-initiated and can afford to wait. Set a longer
-            // AX timeout per app so that busy apps (e.g. Firefox rendering
-            // a heavy page) don't time out on the resize call. The 0.1s
-            // timeout from enumeration is too short when the app is under load.
-            NSMutableDictionary<NSNumber *, NSValue *> *cascadeAxApps =
-                [NSMutableDictionary dictionary];
-            for (int i = 0; i < n; i++) {
-                if (!w[i].axRef) continue;
-                NSNumber *pidKey = @(w[i].pid);
-                if (!cascadeAxApps[pidKey]) {
-                    AXUIElementRef axApp =
-                        AXUIElementCreateApplication((pid_t)w[i].pid);
-                    if (axApp) {
-                        AXUIElementSetMessagingTimeout(axApp, 2.0f);
-                        cascadeAxApps[pidKey] =
-                            [NSValue valueWithPointer:(void *)axApp];
-                    }
-                }
-            }
-
-            int moved = 0, resized = 0, skipped = 0, step = 0;
-            // Iterate back-to-front: backmost window gets step 0 (NW), each
-            // more-front window steps down-right. The frontmost window is
-            // processed last so if AX writes raise the window, it naturally
-            // ends up on top before the raise loop corrects z-order.
+            // Build the list back-to-front: the backmost window gets step 0
+            // (NW corner) and each more-front window steps down-right, so the
+            // frontmost is processed last and ends up on top.
+            gf_place_item_t *items =
+                (gf_place_item_t *)calloc((size_t)n, sizeof(gf_place_item_t));
+            int count = 0;
             for (int i = n - 1; i >= 0; i--) {
-                AXUIElementRef ax = (AXUIElementRef)w[i].axRef;
-                if (!ax) { skipped++; continue; }
-
-                // Skip windows that are neither on the current screen nor
-                // minimized. Background tabs (same-frame NSWindow behind the
-                // frontmost tab) and windows on other Spaces both land here:
-                // they have a valid axRef but onScreen=NO and minimized=NO.
-                if (!w[i].minimized && !w[i].onScreen) { skipped++; continue; }
-
-                if (w[i].minimized) {
-                    AXUIElementSetAttributeValue(ax, kAXMinimizedAttribute,
-                                                 kCFBooleanFalse);
-                }
-                if (gf_isFullScreen(ax)) {
-                    AXUIElementSetAttributeValue(ax,
-                        CFSTR("AXFullScreen"), kCFBooleanFalse);
-                }
-
-                Boolean settable = false;
-                AXError serr = AXUIElementIsAttributeSettable(ax,
-                    kAXPositionAttribute, &settable);
-                if (serr != kAXErrorSuccess || !settable) {
-                    fprintf(stderr,
-                        "go_fish cascade: skipping \"%s\" (%s) — position not settable (err=%d settable=%d)\n",
-                        w[i].title ?: "", w[i].appName ?: "",
-                        (int)serr, (int)settable);
-                    skipped++;
-                    continue;
-                }
-
-                // Resize BEFORE repositioning. A window that is oversized
-                // (e.g. was maximised on a larger external monitor) causes
-                // macOS to clamp the subsequent position set — keeping the
-                // window on-screen at its large size — so step 0 never lands
-                // at (axStartX, axStartY). Shrinking first avoids that clamp.
-                Boolean szSettable = false;
-                AXError szerr = AXUIElementIsAttributeSettable(ax,
-                    kAXSizeAttribute, &szSettable);
-                if (szerr == kAXErrorSuccess && szSettable) {
-                    CGSize sz = CGSizeMake(targetW, targetH);
-                    AXValueRef szVal = AXValueCreate(kAXValueCGSizeType, &sz);
-                    if (szVal) {
-                        AXError rerr = AXUIElementSetAttributeValue(ax,
-                            kAXSizeAttribute, szVal);
-                        CFRelease(szVal);
-                        if (rerr == kAXErrorSuccess) {
-                            resized++;
-                        } else {
-                            fprintf(stderr,
-                                "go_fish cascade: resize rejected for \"%s\" (%s) — AXError=%d\n",
-                                w[i].title ?: "", w[i].appName ?: "", (int)rerr);
-                        }
-                    }
-                } else {
-                    fprintf(stderr,
-                        "go_fish cascade: size not settable for \"%s\" (%s) — err=%d settable=%d\n",
-                        w[i].title ?: "", w[i].appName ?: "",
-                        (int)szerr, (int)szSettable);
-                }
-
-                // step increments only for windows that are actually cascaded,
-                // so gaps from skipped windows don't misalign the staircase.
-                int s = step % maxStep;
-                CGPoint pt = CGPointMake(axStartX + offset * s,
-                                         axStartY + offset * s);
-                AXValueRef ptVal = AXValueCreate(kAXValueCGPointType, &pt);
-                if (!ptVal) { skipped++; continue; }
-                AXError perr = AXUIElementSetAttributeValue(ax,
-                    kAXPositionAttribute, ptVal);
-                CFRelease(ptVal);
-                if (perr != kAXErrorSuccess) {
-                    fprintf(stderr,
-                        "go_fish cascade: failed to move \"%s\" (%s) — AXError=%d\n",
-                        w[i].title ?: "", w[i].appName ?: "", (int)perr);
-                    skipped++;
-                    continue;
-                }
-                step++;
-                moved++;
-            }
-            fprintf(stderr,
-                    "go_fish cascade: moved %d, resized %d, skipped %d of %d (target %.0fx%.0f)\n",
-                    moved, resized, skipped, n, targetW, targetH);
-
-            for (NSValue *val in cascadeAxApps.allValues) {
-                AXUIElementRef axApp = (AXUIElementRef)val.pointerValue;
-                CFRelease(axApp);
-            }
-
-            // Un-minimize, exit-fullscreen, and (on some apps) the AX
-            // position write itself raise the affected window in the global
-            // z-stack, breaking the assumption above that z-order survives
-            // the cascade. Walk back-to-front and re-raise each window so the
-            // staircase ends with the original frontmost on top.
-            //
-            // The raises must be paced: cross-app activations race in
-            // WindowServer when fired in a tight loop, and the previous
-            // dispatch_after-with-precomputed-delays approach was broken —
-            // the move/resize loop above keeps the main queue busy past the
-            // last computed fire time, so every queued block ran back-to-back
-            // with no spacing once we returned. Chain instead: each step
-            // schedules the next, so the gap is always honored.
-            //
-            // Per-step: nominate the target window as the app's main BEFORE
-            // raising. kAXRaiseAction is unreliable on Electron/Chromium
-            // (raises whatever the app already considers main, not the
-            // element we passed) — kAXMainAttribute pins it explicitly.
-            int raiseCount = 0;
-            for (int i = 0; i < n; i++)
-                if (w[i].axRef && (w[i].minimized || w[i].onScreen)) raiseCount++;
-            if (raiseCount > 0) {
-                typedef struct { void *axRef; pid_t pid; } gf_raise_item_t;
-                gf_raise_item_t *items =
-                    (gf_raise_item_t *)malloc(raiseCount * sizeof(gf_raise_item_t));
-                int k = 0;
-                for (int i = n - 1; i >= 0; i--) {  // back-to-front order
-                    if (!w[i].axRef) continue;
-                    if (!w[i].minimized && !w[i].onScreen) continue;
-                    items[k].axRef = (void *)CFRetain((CFTypeRef)w[i].axRef);
-                    items[k].pid   = (pid_t)w[i].pid;
-                    k++;
-                }
-                __block int chainIdx = 0;
-                __block void (^raiseNext)(void) = nil;
-                raiseNext = ^{
-                    if (chainIdx >= raiseCount) {
-                        free(items);
-                        raiseNext = nil;  // break the __block retain cycle
-                        return;
-                    }
-                    int j = chainIdx++;
-                    AXUIElementRef axRef = (AXUIElementRef)items[j].axRef;
-                    pid_t pid = items[j].pid;
-                    @autoreleasepool {
-                        AXUIElementSetAttributeValue(axRef,
-                            kAXMainAttribute, kCFBooleanTrue);
-                        AXUIElementPerformAction(axRef, kAXRaiseAction);
-                        NSRunningApplication *app = [NSRunningApplication
-                            runningApplicationWithProcessIdentifier:pid];
-                        [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
-                        CFRelease(axRef);
-                    }
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                                 100 * NSEC_PER_MSEC),
-                                   dispatch_get_main_queue(), raiseNext);
-                };
-                dispatch_async(dispatch_get_main_queue(), raiseNext);
+                if (!w[i].axRef) continue;
+                // Neither on the current screen nor minimized: background tabs
+                // (same-frame NSWindow behind the frontmost tab) and windows on
+                // other Spaces both land here.
+                if (!w[i].minimized && !w[i].onScreen) continue;
+                gf_appendPlaceItem(items, &count, &w[i]);
             }
 
             for (int i = 0; i < n; i++) {
@@ -1744,6 +2141,20 @@ void gf_cascadeAll(void) {
                 if (w[i].axRef) gf_release(w[i].axRef);
             }
             free(w);
+
+            if (count == 0) { free(items); return; }
+
+            // Activate the app that will end up on top now, before any
+            // placement. Activation raises all of that app's windows as a
+            // block and is asynchronous, so it has to be given room to land
+            // well clear of the restack — see gf_restoreZOrder.
+            NSRunningApplication *front = [NSRunningApplication
+                runningApplicationWithProcessIdentifier:items[count - 1].pid];
+            [front activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+
+            gf_runPlacement(items, count, g, ^(gf_place_item_t *it, int c) {
+                gf_restoreZOrder(it, c);
+            });
         }
     });
 }
@@ -1755,73 +2166,29 @@ void gf_focusApp(int pid) {
         @autoreleasepool {
             int n = 0;
             gf_window_t *all = gf_enumerateWindows(&n, 0);
+            gf_cascade_geom_t g = gf_cascadeGeometry();
 
-            // Screen + cascade parameters (matches gf_cascadeAll).
-            NSPoint cursor = [NSEvent mouseLocation];
-            NSScreen *screen = [NSScreen mainScreen];
-            for (NSScreen *s in [NSScreen screens])
-                if (NSPointInRect(cursor, s.frame)) { screen = s; break; }
-            NSRect vf = screen.visibleFrame;
-            CGFloat primaryH = [NSScreen mainScreen].frame.size.height;
-            for (NSScreen *ps in [NSScreen screens])
-                if (ps.frame.origin.x == 0.0 && ps.frame.origin.y == 0.0)
-                    { primaryH = ps.frame.size.height; break; }
-            CGFloat axStartX = vf.origin.x;
-            CGFloat axStartY = primaryH - (vf.origin.y + vf.size.height);
-            CGFloat offset  = 32.0;
-            CGFloat budget  = MAX(vf.size.height - 300.0, offset * 2);
-            int     maxStep = MAX(1, (int)(budget / offset));
-            CGFloat targetW = MIN(MAX(vf.size.width  * 0.75, 480.0), 1600.0);
-            CGFloat targetH = MIN(MAX(vf.size.height * 0.75, 320.0), 1000.0);
-
+            gf_place_item_t *items = NULL;
+            int count = 0;
             if (all) {
                 qsort(all, n, sizeof(gf_window_t), gf_cmpZOrder); // front-to-back
 
-                // Longer timeout for cascade resize operations (same reason as
-                // gf_cascadeAll: busy apps can't service AX in 100ms).
-                AXUIElementRef focusAxApp =
-                    AXUIElementCreateApplication((pid_t)pid);
-                if (focusAxApp) {
-                    AXUIElementSetMessagingTimeout(focusAxApp, 2.0f);
-                    CFRelease(focusAxApp);
-                }
-
                 // Minimize every window NOT belonging to pid.
                 for (int i = 0; i < n; i++) {
-                    if (all[i].pid == pid || all[i].minimized || !all[i].axRef) continue;
+                    if (all[i].pid == pid || all[i].minimized || !all[i].axRef)
+                        continue;
                     AXUIElementSetAttributeValue((AXUIElementRef)all[i].axRef,
                         kAXMinimizedAttribute, kCFBooleanTrue);
                 }
 
                 // Cascade pid's windows back-to-front so the frontmost window
-                // (i==0) lands at the deepest step and remains visually on top.
-                int step = 0;
+                // lands at the deepest step and remains visually on top.
+                items = (gf_place_item_t *)calloc((size_t)n,
+                                                  sizeof(gf_place_item_t));
                 for (int i = n - 1; i >= 0; i--) {
                     if (all[i].pid != pid || !all[i].axRef) continue;
                     if (!all[i].minimized && !all[i].onScreen) continue;
-                    AXUIElementRef ax = (AXUIElementRef)all[i].axRef;
-
-                    if (all[i].minimized)
-                        AXUIElementSetAttributeValue(ax, kAXMinimizedAttribute, kCFBooleanFalse);
-                    if (gf_isFullScreen(ax))
-                        AXUIElementSetAttributeValue(ax, CFSTR("AXFullScreen"), kCFBooleanFalse);
-
-                    // Resize before repositioning (same reason as gf_cascadeAll:
-                    // avoids macOS clamping the position of an oversized window).
-                    Boolean szSettable = false;
-                    if (AXUIElementIsAttributeSettable(ax, kAXSizeAttribute, &szSettable) == kAXErrorSuccess && szSettable) {
-                        CGSize sz = CGSizeMake(targetW, targetH);
-                        AXValueRef sv = AXValueCreate(kAXValueCGSizeType, &sz);
-                        if (sv) { AXUIElementSetAttributeValue(ax, kAXSizeAttribute, sv); CFRelease(sv); }
-                    }
-                    Boolean settable = false;
-                    if (AXUIElementIsAttributeSettable(ax, kAXPositionAttribute, &settable) == kAXErrorSuccess && settable) {
-                        int s = step % maxStep;
-                        CGPoint pt = CGPointMake(axStartX + offset * s, axStartY + offset * s);
-                        AXValueRef pv = AXValueCreate(kAXValueCGPointType, &pt);
-                        if (pv) { AXUIElementSetAttributeValue(ax, kAXPositionAttribute, pv); CFRelease(pv); }
-                    }
-                    step++;
+                    gf_appendPlaceItem(items, &count, &all[i]);
                 }
 
                 for (int i = 0; i < n; i++) {
@@ -1832,10 +2199,18 @@ void gf_focusApp(int pid) {
                 free(all);
             }
 
-            // Activate the app regardless of whether enumeration succeeded.
-            NSRunningApplication *app = [NSRunningApplication
-                runningApplicationWithProcessIdentifier:(pid_t)pid];
-            [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+            // Activate the app whether or not there was anything to cascade.
+            void (^activate)(void) = ^{
+                NSRunningApplication *app = [NSRunningApplication
+                    runningApplicationWithProcessIdentifier:(pid_t)pid];
+                [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+            };
+
+            if (count == 0) { free(items); activate(); return; }
+            gf_runPlacement(items, count, g, ^(gf_place_item_t *it, int c) {
+                gf_freePlaceItems(it, c);
+                activate();
+            });
         }
     });
 }
@@ -2176,6 +2551,12 @@ static void gf_applySEIState(BOOL active);
 @implementation GFStatusHandler
 - (void)showGrid:(id)sender {
     if (atomic_load(&gActive)) gfOnCancel();
+    // Quick switch is a hotkey-only concept — there is no modifier to release
+    // when the grid is opened from the menu. Clear it so a flag left set by an
+    // abandoned hotkey press (one where gf_showPanel never ran to consume it)
+    // can't make this show a no-op.
+    atomic_store(&gQuickSwitch, 0);
+    atomic_store(&gHotkeyPressNs, 0);
     gfOnHotkey(0, 0);
 }
 - (void)minimizeAll:(id)sender { gf_minimizeAll(); }
@@ -2634,7 +3015,7 @@ static void gf_stopSEITimer(void) {
     addSectionLabel(@"BEHAVIOR", behLabelY);
     self.windowlessCheck = addCheck(@"Show apps without windows",
                                     windowlessY, @selector(toggleWindowless:));
-    self.focusCheck = addCheck(@"Show focus button in grid",
+    self.focusCheck = addCheck(@"Show cascade button in grid",
                                focusY, @selector(toggleFocusButton:));
     self.hotkeyPopup = addPopupRow(@"Hotkey:",
         @[@"Cmd+Tab (default)", @"Ctrl+Tab", @"Option+Tab"],
