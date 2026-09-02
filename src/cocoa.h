@@ -33,7 +33,22 @@ void gf_run(const void *iconBytes, int iconLen);
 
 // Enumeration / release.
 // filterPID == 0 means all regular apps; otherwise only that pid's windows.
+// Both forms must be called on the main thread: the snapshot begins by seeding
+// and reading the MRU list, which is main-thread state.
+//
+// gf_enumerateWindows blocks the caller for the whole AX fan-out. Use it only
+// where blocking is already the shape of the operation (the bulk-arrangement
+// menu actions, which then spend far longer moving windows).
+//
+// gf_enumerateWindowsAsync runs that fan-out off the main thread and invokes
+// `done` back on the main queue, handing over ownership of the list. Use it on
+// the hotkey path: the event tap's run-loop source lives on the main thread, so
+// blocking it there delays the modifier-up that signals a quick switch, and a
+// stalled app can hold it long enough for macOS to disable the tap outright
+// (kCGEventTapDisabledByTimeout). `list` is NULL and `count` 0 if nothing matched.
+typedef void (^gf_enum_done_t)(gf_window_t *list, int count);
 gf_window_t *gf_enumerateWindows(int *out_count, int filterPID);
+void         gf_enumerateWindowsAsync(int filterPID, gf_enum_done_t done);
 void         gf_release(void *axRef);
 
 // PID of the current frontmost application, or 0 if none.
@@ -75,6 +90,12 @@ void gf_focusApp(int pid);
 // gf_toggleSortMode flips the mode, persists it, and returns the new value.
 int gf_getSortMode(void);
 int gf_toggleSortMode(void);
+
+// Whether "Show minimized windows last in the grid" is enabled. Both sort
+// orders have to honour it, and they read it from different places: MRU order
+// gets it baked into the zOrder bands gf_enumerateWindows assigns, while
+// alphabetical order has no zOrder to consult and must ask directly.
+int gf_getMinimizedLast(void);
 
 // Bulk window arrangement, driven by the menu-bar status item.
 // Both operate on every standard window of every regular app (same filter

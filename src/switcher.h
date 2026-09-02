@@ -5,9 +5,13 @@
 // functions were the cgo //export surface and are now plain C, called directly
 // by the event tap and panel UI in cocoa.m.
 //
-// All five are invoked on the main thread (the event-tap source and the panel
+// All are invoked on the main thread (the event-tap source and the panel
 // mouse handlers both run on the main run loop). They guard the shared state
 // with an internal mutex regardless, matching the original's contract.
+//
+// None of them block on window enumeration: gfOnHotkey starts the snapshot and
+// returns, and the grid appears when the list lands. Presses, a hotkey release,
+// or a cancel arriving before then are held and applied on arrival.
 //
 //   shift: nonzero reverses cycle direction.
 //   scope: 0 = all regular apps (Cmd+Tab), 1 = frontmost app only (Cmd+`).

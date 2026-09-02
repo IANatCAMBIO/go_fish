@@ -47,15 +47,23 @@ the same app.
 ```sh
 # Build go_fish.app from ./src into the repo root. No sudo.
 # Requires Xcode Command Line Tools (clang).
-./build.sh
+make
 
 # Launch it (it's a menu-bar app; no auto-launch by default):
-open go_fish.app
+make run          # or: open go_fish.app
 ```
 
-`build.sh` compiles the Objective-C sources, generates the app icon from
-`src/hook.png`, assembles `./go_fish.app`, and ad-hoc signs it. Move the
-bundle wherever you like (e.g. `~/Applications`) — it's self-contained.
+`make` compiles the Objective-C sources, generates the app icon from
+`src/hook.png`, assembles `./go_fish.app`, and signs it. Move the bundle
+wherever you like (e.g. `~/Applications`) — it's self-contained.
+
+Run `make cert` once to create a stable local signing certificate, so the
+Accessibility grant survives rebuilds instead of being reset by each new
+ad-hoc signature.
+
+`make test` runs the switcher state-machine tests. They link the real
+`src/switcher.m` against stub backend functions, so they need no
+permissions, no window server, and no built app.
 
 The first launch will prompt for two permissions in **System Settings →
 Privacy & Security**:
@@ -79,10 +87,11 @@ the menu-bar hook and check **Start at boot**.
 ```
 go_fish/
 ├── README.md
-├── build.sh               # compiles ./src → ./go_fish.app (no auto-launch by default)
-├── go_fish.app            # the built bundle (produced by build.sh)
+├── Makefile               # compiles ./src → ./go_fish.app; also `cert`, `run`, `test`
+├── go_fish.app            # the built bundle (produced by make)
 ├── docs/{USAGE,BUILDING}.md
-└── src/                   # Objective-C source + Info.plist + embedded hook.png
+├── src/                   # Objective-C source + Info.plist + embedded hook.png
+└── test/                  # switcher state-machine tests (make test)
 ```
 
 ## Documentation

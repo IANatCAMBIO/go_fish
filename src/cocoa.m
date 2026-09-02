@@ -75,6 +75,19 @@ extern AXError _AXUIElementGetWindow(AXUIElementRef element, CGWindowID *out);
 // =========================================================================
 
 static atomic_int        gActive = 0;          // 1 when panel is up.
+
+// Monotonic token identifying the newest panel-show request. gf_showPanel
+// defers the actual show by the quick-switch delay, so a teardown — or a
+// second hotkey press — can land in between. Without this, that deferred
+// block orders the panel back on screen after the switcher has already closed
+// it, leaving gActive=1 while the switcher's gSwOpen is false: a grid that
+// ignores Escape, clicks and commits, because every switcher entry point
+// early-returns when it believes nothing is open. gQuickSwitch does not cover
+// this — it is a single global flag, consumed by whichever deferred block
+// runs first, so a second show in flight finds it clear and proceeds.
+// Bumped by gf_showPanel and gf_hidePanel; a deferred show bails unless its
+// token is still the current one.
+static atomic_ullong     gShowToken = 0;
 static CFMachPortRef     gEventTap = NULL;
 static CFRunLoopSourceRef gEventTapSrc = NULL;
 
@@ -504,34 +517,98 @@ static NSArray<NSNumber *> *gf_onScreenWindows(
     return ordered;
 }
 
-gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
+// Positions in the per-window attribute request handed to
+// AXUIElementCopyMultipleAttributeValues. The result array is positional, so
+// these index both the request and the response.
+enum {
+    kWinAttrMinimized = 0,
+    kWinAttrSubrole   = 1,
+    kWinAttrTitle     = 2,
+};
+
+/*
+ * gf_batchValue — read one slot out of a multiple-attribute-value result.
+ *
+ * AXUIElementCopyMultipleAttributeValues reports a per-attribute failure in
+ * place rather than failing the whole request: the slot then holds kCFNull or
+ * an AXValueRef wrapping an AXError. Both mean "no value", which is exactly
+ * what a failed single-attribute copy would have left behind.
+ *
+ * Inputs:
+ *   values — result array, or NULL if the batch call itself failed
+ *   idx    — position of the wanted attribute in the request array
+ *
+ * Output:
+ *   Borrowed (non-owning) reference to the value, or NULL if it is absent.
+ *   The returned reference is owned by `values` and dies with it.
+ */
+static CFTypeRef gf_batchValue(CFArrayRef values, CFIndex idx) {
+    if (!values || idx >= CFArrayGetCount(values)) return NULL;
+    CFTypeRef v = CFArrayGetValueAtIndex(values, idx);
+    if (!v || CFGetTypeID(v) == CFNullGetTypeID()) return NULL;
+    if (CFGetTypeID(v) == AXValueGetTypeID() &&
+        AXValueGetType((AXValueRef)v) == kAXValueAXErrorType) return NULL;
+    return v;
+}
+
+/*
+ * gf_enumeratePrologue — main-thread-only preamble to a window snapshot.
+ *
+ * Split out from the AX fan-out because it touches gMRU, which is main-thread
+ * state: gf_seedMRUTail mutates it and gf_pushMRU rewrites it from app-activation
+ * notifications. The fan-out itself is thread-agnostic and reads only the two
+ * immutable dictionaries produced here.
+ *
+ * Must be called on the main thread.
+ *
+ * Outputs (both +0, autoreleased, immutable and safe for concurrent reads):
+ *   out_cgIndex  — CGWindowID -> front-to-back index, for sort and on-screen test
+ *   out_mruIndex — CGWindowID -> MRU rank
+ */
+static void gf_enumeratePrologue(NSDictionary<NSNumber *, NSNumber *> **out_cgIndex,
+                                 NSDictionary<NSNumber *, NSNumber *> **out_mruIndex) {
+    NSDictionary<NSNumber *, NSNumber *> *cgIndex = nil;
+    NSArray<NSNumber *> *onScreen = gf_onScreenWindows(&cgIndex);
+
+    // Record anything on screen the MRU has never seen before taking the
+    // snapshot below, so this pass already ranks it. Without this a window
+    // created after startup and never activated from another app is absent
+    // from the MRU entirely, and lands behind every stale entry in it.
+    gf_seedMRUTail(onScreen);
+
+    // Snapshot MRU into a winID -> index dict so workers can do O(1)
+    // lookups without touching the mutable gMRU array (which the main
+    // thread may rewrite via gf_pushMRU).
+    NSMutableDictionary<NSNumber *, NSNumber *> *m =
+        [NSMutableDictionary dictionaryWithCapacity:gMRU.count];
+    [gMRU enumerateObjectsUsingBlock:^(NSNumber *wid, NSUInteger idx, BOOL *_) {
+        m[wid] = @(idx);
+    }];
+
+    *out_cgIndex  = cgIndex;
+    *out_mruIndex = [m copy];
+}
+
+/*
+ * gf_enumerateAX — the per-app / per-window AX fan-out.
+ *
+ * Callable from any thread: every input is immutable and each worker owns its
+ * own AXUIElementRefs and result slot.
+ *
+ * Inputs:
+ *   filterPID — 0 for all regular apps, otherwise only that pid's windows
+ *   cgIndex   — from gf_enumeratePrologue
+ *   mruIndex  — from gf_enumeratePrologue
+ *
+ * Output:
+ *   malloc'd array of *out_count entries (caller frees per cocoa.h), or NULL
+ *   when nothing matched. *out_count is set to 0 in that case.
+ */
+static gf_window_t *gf_enumerateAX(int *out_count, int filterPID,
+                                   NSDictionary<NSNumber *, NSNumber *> *cgIndex,
+                                   NSDictionary<NSNumber *, NSNumber *> *mruIndex) {
     *out_count = 0;
     @autoreleasepool {
-        // CGWindowID -> front-to-back-index map for sort + on-screen test.
-        // Built once on the calling thread, then read concurrently from
-        // workers; the map is immutable, so those reads are documented-safe.
-        NSDictionary<NSNumber *, NSNumber *> *cgIndex = nil;
-        NSArray<NSNumber *> *onScreen = gf_onScreenWindows(&cgIndex);
-
-        // Record anything on screen the MRU has never seen before taking the
-        // snapshot below, so this pass already ranks it. Without this a window
-        // created after startup and never activated from another app is absent
-        // from the MRU entirely, and lands behind every stale entry in it.
-        gf_seedMRUTail(onScreen);
-
-        // Snapshot MRU into a winID -> index dict so workers can do O(1)
-        // lookups without touching the mutable gMRU array (which the main
-        // thread may rewrite via gf_pushMRU).
-        NSDictionary<NSNumber *, NSNumber *> *mruIndex;
-        {
-            NSMutableDictionary<NSNumber *, NSNumber *> *m =
-                [NSMutableDictionary dictionaryWithCapacity:gMRU.count];
-            [gMRU enumerateObjectsUsingBlock:^(NSNumber *wid, NSUInteger idx, BOOL *_) {
-                m[wid] = @(idx);
-            }];
-            mruIndex = [m copy];
-        }
-
         // Filter the running-apps list down to what we'll actually query.
         NSArray<NSRunningApplication *> *apps =
             [[NSWorkspace sharedWorkspace] runningApplications];
@@ -552,6 +629,12 @@ gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
 
         // Per-app result slots. Each worker owns one slot — no sharing.
         gf_slot_t *slots = (gf_slot_t *)calloc(napps, sizeof(gf_slot_t));
+
+        // Built once and read concurrently by every worker; immutable, so the
+        // shared read is safe. Order matches the kWinAttr* indices.
+        NSArray *winAttrs = @[(__bridge id)kAXMinimizedAttribute,
+                              (__bridge id)kAXSubroleAttribute,
+                              (__bridge id)kAXTitleAttribute];
 
         // Parallelize the per-app AX queries. AX calls on distinct
         // AXUIElementRefs are safe to call concurrently, and each worker
@@ -622,27 +705,38 @@ gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
                 for (CFIndex j = 0; j < wc; j++) {
                     AXUIElementRef w = (AXUIElementRef)CFArrayGetValueAtIndex(axWins, j);
 
+                    // The timeout set on axApp does not reach its windows:
+                    // AXUIElementSetMessagingTimeout binds to the object it is
+                    // called on, "not for other accessibility objects that are
+                    // equal to it" (AXUIElement.h). Without this line an app
+                    // that answers AXWindows and then stalls on a per-window
+                    // read holds the snapshot for the global default rather
+                    // than kAXAppTimeout, which is the stall this budget exists
+                    // to prevent. Local bookkeeping — no round trip.
+                    AXUIElementSetMessagingTimeout(w, kAXAppTimeout);
+
+                    // One round trip for all three attributes. Asking
+                    // separately costs three synchronous IPCs per window, and
+                    // per-window IPC is what dominates enumeration once an app
+                    // holds more than a handful of windows.
+                    CFArrayRef vals = NULL;
+                    AXUIElementCopyMultipleAttributeValues(
+                        w, (__bridge CFArrayRef)winAttrs, 0, &vals);
+
                     // Minimized state first: minimized windows always pass
                     // the subrole filter below, since some apps return them
                     // with a non-standard (or absent) subrole once minimized.
-                    CFTypeRef minRef = NULL;
-                    AXUIElementCopyAttributeValue(w, kAXMinimizedAttribute, &minRef);
-                    BOOL minimized = NO;
-                    if (minRef) {
-                        minimized = CFBooleanGetValue((CFBooleanRef)minRef);
-                        CFRelease(minRef);
-                    }
+                    CFTypeRef minRef = gf_batchValue(vals, kWinAttrMinimized);
+                    BOOL minimized = minRef && CFBooleanGetValue((CFBooleanRef)minRef);
+                    // ARC retains both strong locals, so they outlive the array
+                    // that owns the raw values and there is one release point
+                    // regardless of which filter below skips the window.
+                    NSString *subrole = (__bridge NSString *)gf_batchValue(vals, kWinAttrSubrole);
+                    NSString *title   = (__bridge NSString *)gf_batchValue(vals, kWinAttrTitle);
+                    if (vals) CFRelease(vals);
 
-                    if (!minimized) {
-                        CFTypeRef subroleRef = NULL;
-                        AXUIElementCopyAttributeValue(w, kAXSubroleAttribute, &subroleRef);
-                        NSString *subrole = (__bridge_transfer NSString *)subroleRef;
-                        if (subrole && ![subrole isEqualToString:(NSString *)kAXStandardWindowSubrole]) continue;
-                    }
-
-                    CFTypeRef titleRef = NULL;
-                    AXUIElementCopyAttributeValue(w, kAXTitleAttribute, &titleRef);
-                    NSString *title = (__bridge_transfer NSString *)titleRef;
+                    if (!minimized && subrole &&
+                        ![subrole isEqualToString:(NSString *)kAXStandardWindowSubrole]) continue;
                     if (!title) title = @"";
 
                     CGWindowID winID = 0;
@@ -738,6 +832,25 @@ gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
     }
 }
 
+gf_window_t *gf_enumerateWindows(int *out_count, int filterPID) {
+    NSDictionary<NSNumber *, NSNumber *> *cgIndex, *mruIndex;
+    gf_enumeratePrologue(&cgIndex, &mruIndex);
+    return gf_enumerateAX(out_count, filterPID, cgIndex, mruIndex);
+}
+
+void gf_enumerateWindowsAsync(int filterPID, gf_enum_done_t done) {
+    NSDictionary<NSNumber *, NSNumber *> *cgIndex, *mruIndex;
+    gf_enumeratePrologue(&cgIndex, &mruIndex);
+    gf_enum_done_t cb = [done copy];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+        @autoreleasepool {
+            int n = 0;
+            gf_window_t *list = gf_enumerateAX(&n, filterPID, cgIndex, mruIndex);
+            dispatch_async(dispatch_get_main_queue(), ^{ cb(list, n); });
+        }
+    });
+}
+
 void gf_release(void *axRef) {
     if (axRef) CFRelease((CFTypeRef)axRef);
 }
@@ -792,6 +905,35 @@ static NSInteger gf_pickCols(NSInteger n) {
     return cols;
 }
 
+// Sort-toggle geometry. The toggle is a two-segment pill pinned to the panel's
+// bottom-right corner; kSortToggleInset is its gap from the bottom edge.
+static const CGFloat kSortToggleSegW  = 58;
+static const CGFloat kSortToggleH     = 16;
+static const CGFloat kSortToggleSegGap = 1;
+static const CGFloat kSortToggleInset = 8;
+static const CGFloat kSortToggleRightInset = 14;
+
+// How far the selected cell's highlight is outset beyond the cell itself. The
+// halo is the lowest thing a bottom-row tile draws, so it — not the cell edge —
+// is what has to clear the sort toggle.
+static const CGFloat kSelectionHalo = 6;
+
+/*
+ * gf_gridBottomInset — space between the panel's bottom edge and the bottom of
+ * the last row of cells.
+ *
+ * Larger than the plain margin used on the other three sides because the sort
+ * toggle lives in this band. Reserves the toggle's own height and inset, the
+ * halo the bottom row can draw below its cells, and the same amount again as
+ * visual separation between the two.
+ *
+ * Output:
+ *   points to reserve below the grid.
+ */
+static CGFloat gf_gridBottomInset(void) {
+    return kSortToggleInset + kSortToggleH + 2 * kSelectionHalo;
+}
+
 // Preferred panel size at full tile dimensions. Caller is responsible for
 // clamping to screen bounds if the result is too large.
 static NSSize gf_preferredPanelSize(NSInteger n) {
@@ -803,7 +945,7 @@ static NSSize gf_preferredPanelSize(NSInteger n) {
     NSInteger cols = gf_pickCols(n);
     NSInteger rows = (n + cols - 1) / cols;
     CGFloat w = 2*margin + cols*tileW + (cols-1)*gap;
-    CGFloat h = 2*margin + rows*cellH + (rows-1)*gap;
+    CGFloat h = margin + gf_gridBottomInset() + rows*cellH + (rows-1)*gap;
     return NSMakeSize(w, h);
 }
 
@@ -825,7 +967,7 @@ static NSSize gf_preferredPanelSize(NSInteger n) {
     NSInteger rows = (n + L.cols - 1) / L.cols;
 
     CGFloat availW = b.size.width  - 2*L.margin;
-    CGFloat availH = b.size.height - 2*L.margin;
+    CGFloat availH = b.size.height - L.margin - gf_gridBottomInset();
 
     // tileW from each constraint; pick the smaller so every row fits and
     // nothing clips off the bottom of a clamped panel. tileH = tileW * 0.65.
@@ -892,9 +1034,9 @@ static NSSize gf_preferredPanelSize(NSInteger n) {
 // Bottom-right sort toggle: two segments "Recent" | "By App".
 // 58pt each with 1pt gap; 14pt from right edge (inside corner radius), 8pt from bottom.
 static NSRect gf_sortToggleRect(NSRect bounds) {
-    CGFloat segW = 58, h = 16, gap = 1;
-    CGFloat totalW = segW * 2 + gap;
-    return NSMakeRect(NSMaxX(bounds) - totalW - 14, 8, totalW, h);
+    CGFloat totalW = kSortToggleSegW * 2 + kSortToggleSegGap;
+    return NSMakeRect(NSMaxX(bounds) - totalW - kSortToggleRightInset,
+                      kSortToggleInset, totalW, kSortToggleH);
 }
 
 - (NSInteger)indexAtPoint:(NSPoint)p layout:(gf_layout_t)L {
@@ -922,11 +1064,11 @@ static NSRect gf_sortToggleRect(NSRect bounds) {
     gf_layout_t L = [self layoutForCount:n];
     if (prev >= 0 && prev < n) {
         [self setNeedsDisplayInRect:
-            NSInsetRect([self cellRectForIndex:prev layout:L], -6, -6)];
+            NSInsetRect([self cellRectForIndex:prev layout:L], -kSelectionHalo, -kSelectionHalo)];
     }
     if (idx >= 0 && idx < n) {
         [self setNeedsDisplayInRect:
-            NSInsetRect([self cellRectForIndex:idx layout:L], -6, -6)];
+            NSInsetRect([self cellRectForIndex:idx layout:L], -kSelectionHalo, -kSelectionHalo)];
     }
 }
 
@@ -976,7 +1118,7 @@ static void gf_initDrawAttrs(void) {
     for (NSInteger i = 0; i < n; i++) {
         // Skip cells outside the dirty rect. Combined with cell-scoped dirty
         // marking in updateSelection:, this keeps mouseMoved redraws cheap.
-        NSRect outsetCell = NSInsetRect([self cellRectForIndex:i layout:L], -6, -6);
+        NSRect outsetCell = NSInsetRect([self cellRectForIndex:i layout:L], -kSelectionHalo, -kSelectionHalo);
         if (!NSIntersectsRect(outsetCell, dirty)) continue;
 
         NSRect imgR   = [self imageRectForIndex:i layout:L];
@@ -996,7 +1138,7 @@ static void gf_initDrawAttrs(void) {
         GFEntry *e = self.entries[i];
 
         if (i == self.selected) {
-            NSRect hi = NSInsetRect([self cellRectForIndex:i layout:L], -6, -6);
+            NSRect hi = NSInsetRect([self cellRectForIndex:i layout:L], -kSelectionHalo, -kSelectionHalo);
             NSBezierPath *h = [NSBezierPath bezierPathWithRoundedRect:hi xRadius:10 yRadius:10];
             [[[NSColor controlAccentColor] colorWithAlphaComponent:0.55] setFill];
             [h fill];
@@ -1378,18 +1520,59 @@ static void gf_scheduleThumbPurge(void) {
     }];
 }
 
+// Minimum wait before ordering the panel front, even when the quick-switch
+// window has already fully elapsed. The panel must never be shown in the same
+// run-loop turn as a modifier-up still sitting in the HID tap's Mach port: the
+// main queue would win that race and the grid would flash on a tap-and-release.
+// A drain floor, not a user preference — hence separate from gQuickSwitchDelayMs.
+static const int kShowDrainFloorMs = 16;
+
+/*
+ * gf_showDelayMs — remaining quick-switch wait owed before drawing the grid.
+ *
+ * The quick-switch window is defined from the hotkey *press*: the tap callback
+ * stamps gHotkeyPressNs, and the modifier-up test in tapCallback measures the
+ * release against that same instant. Window enumeration runs between the press
+ * and this call, so waiting the full delay here would stack it on top of time
+ * the window has already absorbed. Charge the elapsed time against the budget
+ * instead, so the grid appears one delay after the press rather than one delay
+ * after enumeration finishes.
+ *
+ * Output:
+ *   milliseconds to wait. Never below the drain floor, except when the user's
+ *   configured delay is itself shorter — their preference wins over the floor.
+ */
+static int gf_showDelayMs(void) {
+    int budget = atomic_load(&gQuickSwitchDelayMs);
+    int floorMs = budget < kShowDrainFloorMs ? budget : kShowDrainFloorMs;
+    uint64_t pressed = atomic_load(&gHotkeyPressNs);
+    // No pending press: a menu-driven show. Nothing to charge, nothing to race.
+    if (pressed == 0) return floorMs;
+    int elapsed = (int)((gf_nowNs() - pressed) / NSEC_PER_MSEC);
+    int remaining = budget - elapsed;
+    return remaining > floorMs ? remaining : floorMs;
+}
+
 void gf_showPanel(void *data, int selected) {
     gf_pd_t *d = (gf_pd_t *)data;
-    // 100 ms delay before showing the panel so the run loop has time to drain
-    // any pending HID events (modifier-up) before we commit to drawing the
-    // grid. This is the "quick-switch window": if the user releases the hotkey
+    uint64_t token = atomic_fetch_add(&gShowToken, 1) + 1;
+    // Delay before showing the panel so the run loop has time to drain any
+    // pending HID events (modifier-up) before we commit to drawing the grid.
+    // This is the "quick-switch window": if the user releases the hotkey
     // modifier within this period, gQuickSwitch is set to 1 and the block
     // below bails out instead of showing the panel. Without the delay the
     // dispatch queue can win the run loop race against the HID tap Mach port,
     // causing the panel to flash briefly even on a quick tap.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                (int64_t)atomic_load(&gQuickSwitchDelayMs) * NSEC_PER_MSEC),
+                                (int64_t)gf_showDelayMs() * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{
+        // Superseded while we waited: the switcher tore this activation down,
+        // or a newer hotkey press scheduled its own show. Either way, showing
+        // now would strand a panel the switcher no longer tracks.
+        if (atomic_load(&gShowToken) != token) {
+            freePanelData(d);
+            return;
+        }
         // Quick-switch: hotkey released before panel opened. Skip the grid;
         // gfOnCommit is already queued and will activate the window.
         if (atomic_load(&gQuickSwitch)) {
@@ -1436,7 +1619,8 @@ void gf_showPanel(void *data, int selected) {
             // eliminates that gap. topY must track the new height.
             NSInteger rows = ((NSInteger)d->count + L.cols - 1) / L.cols;
             CGFloat exactW = 2*L.margin + L.cols*L.tileW + (L.cols-1)*L.gap;
-            CGFloat exactH = 2*L.margin + rows*L.cellH  + (rows-1)*L.gap;
+            CGFloat exactH = L.margin + gf_gridBottomInset()
+                           + rows*L.cellH + (rows-1)*L.gap;
             L.topY = exactH - L.margin;
             gPanelView.baseLayout    = L;
             gPanelView.hasBaseLayout = YES;
@@ -1479,6 +1663,9 @@ void gf_updateSelection(int selected) {
 }
 
 void gf_hidePanel(void) {
+    // Invalidate any show still waiting out the quick-switch delay before it
+    // can put the panel back up behind the switcher's back.
+    atomic_fetch_add(&gShowToken, 1);
     atomic_store(&gActive, 0);
     void (^hide)(void) = ^{
         if (gPanelView) {
@@ -1605,6 +1792,10 @@ void gf_quitApp(int pid) {
 
 int gf_getSortMode(void) {
     return atomic_load(&gSortByApp);
+}
+
+int gf_getMinimizedLast(void) {
+    return atomic_load(&gMinimizedLast);
 }
 
 int gf_toggleSortMode(void) {
@@ -2525,6 +2716,11 @@ static void gf_retryActivationPush(pid_t pid, int attempt) {
 static CGWindowID gf_focusedWindowForPID(pid_t pid) {
     AXUIElementRef axApp = AXUIElementCreateApplication(pid);
     if (!axApp) return 0;
+    // Runs on the main thread, on every app activation and again on each
+    // activation retry. An app that is slow to answer must not stall the run
+    // loop: a timeout here just reads as "no window yet", which the retry
+    // path already handles.
+    AXUIElementSetMessagingTimeout(axApp, kAXAppTimeout);
     CFTypeRef focused = NULL;
     AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute, &focused);
     CGWindowID winID = 0;

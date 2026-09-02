@@ -12,7 +12,9 @@ FWORKS  := -framework Cocoa \
            -framework CoreGraphics \
            -framework CoreServices
 
-.PHONY: all clean run cert
+TEST_BIN := build/switcher_test
+
+.PHONY: all clean run cert test
 
 all: $(APP)
 
@@ -94,5 +96,15 @@ $(ICNS): src/hook.png | $(APP)/Contents/Resources
 run: all
 	open $(APP)
 
+# Switcher state-machine tests. Links the real src/switcher.m against stub
+# gf_* backend functions (test/switcher_test.m), so no AX permission, no
+# window server, and no UI are involved.
+test: $(TEST_BIN)
+	@./$(TEST_BIN)
+
+$(TEST_BIN): test/switcher_test.m src/switcher.m src/switcher.h src/cocoa.h
+	@mkdir -p build
+	clang $(CFLAGS) -framework Foundation test/switcher_test.m src/switcher.m -o $@
+
 clean:
-	rm -rf $(APP) $(HOOK_H)
+	rm -rf $(APP) $(HOOK_H) build
