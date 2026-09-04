@@ -1902,6 +1902,7 @@ typedef struct {
     pid_t          pid;
     CGWindowID     wid;         // 0 if unknown; used to verify the final stack
     int            minimized;   // was minimized at enumeration time
+    int            hidden;      // owning app was hidden (Cmd-H) at enumeration time
     char          *label;       // malloc'd "App — Title", for diagnostics
 } gf_place_item_t;
 
@@ -2015,6 +2016,44 @@ static BOOL gf_setBoolAttrAndWait(AXUIElementRef ax, CFStringRef attr,
         if (now == desired) return YES;
         usleep(stepUS);
     }
+    return NO;
+}
+
+/*
+ * gf_unhideAppAndWait — bring a hidden (Cmd-H) app back on screen.
+ *
+ * A hidden app's windows report minimized=NO and are absent from the
+ * WindowServer's on-screen list, so nothing about them can be placed until the
+ * app is visible again. Unhiding is asynchronous, and geometry written before
+ * it completes is discarded the same way a mid-restore write is, so wait for
+ * the app to report itself visible before returning.
+ *
+ * -unhide only reverses the hide; unlike -activate it does not bring the app
+ * forward, so the cascade's own activation still decides what ends up on top.
+ *
+ * Inputs:
+ *   pid       — the owning process
+ *   timeoutUS — give up after this long
+ *
+ * Output:
+ *   YES if the app is visible (including when it never was hidden), NO on
+ *   timeout or if the process has gone away.
+ *
+ * Must not be called on the main thread: it sleeps.
+ */
+static BOOL gf_unhideAppAndWait(pid_t pid, useconds_t timeoutUS) {
+    NSRunningApplication *app =
+        [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+    if (!app) return NO;
+    if (!app.hidden) return YES;
+    [app unhide];
+
+    const useconds_t stepUS = 40 * 1000;
+    for (useconds_t waited = 0; waited <= timeoutUS; waited += stepUS) {
+        if (!app.hidden) return YES;
+        usleep(stepUS);
+    }
+    fprintf(stderr, "go_fish cascade: app pid %d never unhid\n", (int)pid);
     return NO;
 }
 
@@ -2171,18 +2210,20 @@ static void gf_freePlaceItems(gf_place_item_t *items, int count) {
  * gf_appendPlaceItem — add one enumerated window to a placement list.
  *
  * Inputs:
- *   items — list with room for at least *count + 1 entries
- *   count — current length, incremented on success
- *   w     — the enumeration entry to copy from (its axRef is retained and its
- *           strings are duplicated, so w can be freed straight afterwards)
+ *   items  — list with room for at least *count + 1 entries
+ *   count  — current length, incremented on success
+ *   w      — the enumeration entry to copy from (its axRef is retained and its
+ *            strings are duplicated, so w can be freed straight afterwards)
+ *   hidden — 1 if w's app was hidden; the placement worker unhides it first
  */
 static void gf_appendPlaceItem(gf_place_item_t *items, int *count,
-                               const gf_window_t *w) {
+                               const gf_window_t *w, int hidden) {
     gf_place_item_t *it = &items[*count];
     it->ax        = (AXUIElementRef)CFRetain((CFTypeRef)w->axRef);
     it->pid       = (pid_t)w->pid;
     it->wid       = (CGWindowID)w->windowID;
     it->minimized = w->minimized;
+    it->hidden    = hidden;
     it->label     = NULL;
     asprintf(&it->label, "%s — %s", w->appName ?: "", w->title ?: "");
     (*count)++;
@@ -2218,6 +2259,15 @@ static void gf_runPlacement(gf_place_item_t *items, int count,
 
                 // Let any animated state change finish before writing
                 // geometry — a restore that completes afterwards undoes it.
+                // Unhide first: a hidden app's windows are off screen, and
+                // un-minimizing one of them unhides the app as a side effect,
+                // which would drag its *other* windows back on screen
+                // mid-pass. Doing it explicitly and waiting keeps every window
+                // of the app in a known state before any geometry is written.
+                // Cheap to repeat per window: it returns at once once visible.
+                if (items[i].hidden) {
+                    gf_unhideAppAndWait(items[i].pid, kPlaceTransitionUS);
+                }
                 if (items[i].minimized) {
                     gf_setBoolAttrAndWait(ax, kAXMinimizedAttribute, NO,
                                           kPlaceTransitionUS);
@@ -2382,6 +2432,47 @@ static void gf_restoreZOrder(gf_place_item_t *items, int count) {
     });
 }
 
+/*
+ * gf_hiddenPids — pids of every regular app currently hidden (Cmd-H).
+ *
+ * A hidden app's windows read back as not-minimized and are absent from the
+ * WindowServer's on-screen list, so the enumeration snapshot cannot tell them
+ * apart from a window parked on another Space. Asking NSWorkspace separates
+ * the two.
+ *
+ * Output:
+ *   Autoreleased set of boxed pid_t. Must be called on the main thread.
+ */
+static NSSet<NSNumber *> *gf_hiddenPids(void) {
+    NSMutableSet<NSNumber *> *out = [NSMutableSet set];
+    for (NSRunningApplication *a in [NSWorkspace sharedWorkspace].runningApplications)
+        if (a.hidden) [out addObject:@((int)a.processIdentifier)];
+    return out;
+}
+
+/*
+ * gf_hoistApp — move every entry belonging to pid to the end of the list,
+ * keeping relative order within both the moved and the unmoved entries.
+ *
+ * items is back-to-front, so the end of the list is the top of the staircase.
+ * See gf_cascadeAll for why the destination app has to sit there as one block.
+ *
+ * Inputs:
+ *   items — placement list, must not be NULL
+ *   count — number of entries
+ *   pid   — the app to hoist
+ */
+static void gf_hoistApp(gf_place_item_t *items, int count, pid_t pid) {
+    gf_place_item_t *tmp =
+        (gf_place_item_t *)malloc((size_t)count * sizeof(gf_place_item_t));
+    if (!tmp) return;
+    int k = 0;
+    for (int i = 0; i < count; i++) if (items[i].pid != pid) tmp[k++] = items[i];
+    for (int i = 0; i < count; i++) if (items[i].pid == pid) tmp[k++] = items[i];
+    memcpy(items, tmp, (size_t)count * sizeof(gf_place_item_t));
+    free(tmp);
+}
+
 void gf_cascadeAll(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
@@ -2393,6 +2484,7 @@ void gf_cascadeAll(void) {
             qsort(w, n, sizeof(gf_window_t), gf_cmpZOrder);
 
             gf_cascade_geom_t g = gf_cascadeGeometry();
+            NSSet<NSNumber *> *hidden = gf_hiddenPids();
 
             // Build the list back-to-front: the backmost window gets step 0
             // (NW corner) and each more-front window steps down-right, so the
@@ -2402,11 +2494,15 @@ void gf_cascadeAll(void) {
             int count = 0;
             for (int i = n - 1; i >= 0; i--) {
                 if (!w[i].axRef) continue;
-                // Neither on the current screen nor minimized: background tabs
-                // (same-frame NSWindow behind the frontmost tab) and windows on
-                // other Spaces both land here.
-                if (!w[i].minimized && !w[i].onScreen) continue;
-                gf_appendPlaceItem(items, &count, &w[i]);
+                int isHidden = [hidden containsObject:@(w[i].pid)] ? 1 : 0;
+                // Neither on the current screen, nor minimized, nor hidden:
+                // background tabs (same-frame NSWindow behind the frontmost
+                // tab) and windows on other Spaces both land here. A hidden
+                // app's windows look identical from the snapshot, which is why
+                // NSWorkspace is consulted rather than the snapshot alone —
+                // they are cascaded, and the placement worker unhides the app.
+                if (!w[i].minimized && !w[i].onScreen && !isHidden) continue;
+                gf_appendPlaceItem(items, &count, &w[i], isHidden);
             }
 
             for (int i = 0; i < n; i++) {
@@ -2417,6 +2513,24 @@ void gf_cascadeAll(void) {
             free(w);
 
             if (count == 0) { free(items); return; }
+
+            // Give the destination app the top of the staircase, as one
+            // contiguous block, rather than letting its windows interleave
+            // with everyone else's in MRU order.
+            //
+            // This is forced by how macOS orders windows, not by taste.
+            // kAXRaiseAction cannot lift a background app's window above the
+            // *active* app's front window: measured with Notes active and one
+            // of its windows raised to position 0, raising a MacVim window
+            // reached position 1 and no further, while the same pair with a
+            // third app active interleaved normally. So every window of the
+            // destination app that sits mid-staircase becomes a ceiling that
+            // the windows meant to cover it can never get past, and the
+            // re-stack in gf_restoreZOrder burns all its passes failing to fix
+            // an arrangement macOS will not produce. With the destination app
+            // as the top block the ceiling is exactly where the cascade wants
+            // it, and every other app orders freely underneath.
+            gf_hoistApp(items, count, items[count - 1].pid);
 
             // Activate the app that will end up on top now, before any
             // placement. Activation raises all of that app's windows as a
@@ -2460,10 +2574,12 @@ void gf_focusApp(int pid) {
                 // lands at the deepest step and remains visually on top.
                 items = (gf_place_item_t *)calloc((size_t)n,
                                                   sizeof(gf_place_item_t));
+                int isHidden = [gf_hiddenPids() containsObject:@(pid)] ? 1 : 0;
                 for (int i = n - 1; i >= 0; i--) {
                     if (all[i].pid != pid || !all[i].axRef) continue;
-                    if (!all[i].minimized && !all[i].onScreen) continue;
-                    gf_appendPlaceItem(items, &count, &all[i]);
+                    if (!all[i].minimized && !all[i].onScreen && !isHidden)
+                        continue;
+                    gf_appendPlaceItem(items, &count, &all[i], isHidden);
                 }
 
                 for (int i = 0; i < n; i++) {
