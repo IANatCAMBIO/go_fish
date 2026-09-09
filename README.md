@@ -23,7 +23,7 @@ the same app.
 - **Space-aware** — activating a window on another Space switches Spaces
   automatically
 - **Menu-bar entry** with Show Window Grid, Minimize All, Cascade All,
-  Start at boot, Secure Event Input detection, and Quit
+  About, Settings, and Quit
 - **Opt-in auto-launch** — toggle **Start at boot** in the menu to add
   go_fish to your Login Items (System Settings > General > Login Items),
   with a built-in 3-attempt backoff so a missing permission can never

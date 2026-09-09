@@ -57,6 +57,9 @@ go_fish is running. Click it to drop down a menu:
   AX position writes (fixed-UI Electron tools, full-screen apps that
   don't expose `AXFullScreen`, etc.) are skipped silently; the log file
   (`~/Library/Logs/go_fish.err.log`) records which.
+- **About…** — a small window with the app version and the date the
+  running binary was compiled. The GPL 3.0 licence and `http://camb.io`
+  links open in your default browser.
 - **Start at boot** (toggle) — adds / removes the `go_fish.app` bundle in
   your per-user **Login Items** (System Settings → General → Login Items).
   Effective on next login; the currently running instance is not

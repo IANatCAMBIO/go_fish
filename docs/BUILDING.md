@@ -20,7 +20,7 @@ everything:
 | `make run`    | `make`, then `open go_fish.app`                                  |
 | `make cert`   | One-time: create the local signing cert so permissions survive rebuilds |
 | `make test`   | Build and run the switcher state-machine tests                   |
-| `make clean`  | Remove `go_fish.app`, the generated `hook_png.h`, and `build/`   |
+| `make clean`  | Remove `go_fish.app`, the generated `*_png.h`, and `build/`      |
 
 ```sh
 make                     # compiles ./src → ./go_fish.app
@@ -29,8 +29,11 @@ open go_fish.app         # or: make run
 
 The build does four things:
 
-1. Generates `src/hook_png.h` from `src/hook.png` via `xxd -i` — the embedded
-   menu-bar icon, as a `hook_png[]` byte array.
+1. Generates `src/hook_png.h` and `src/maui_png.h` from `src/hook.png` and
+   `src/maui.png` via `xxd -i` — the embedded menu-bar icon and About-window
+   image, as `hook_png[]` / `maui_png[]` byte arrays. One pattern rule
+   (`src/%_png.h: src/%.png`) covers both, so dropping another PNG in `src/`
+   and adding it to `EMBED_H` is all a third embedded image needs.
 2. Compiles `main.m`, `cocoa.m`, and `switcher.m` in a **single** clang
    invocation to `go_fish.app/Contents/MacOS/go_fish` (~210 KB, arm64).
 3. Assembles the rest of the bundle: `Contents/Info.plist` (copied from
@@ -51,8 +54,8 @@ Item with no Terminal window; see
 The build is incremental against real prerequisites: touching any source
 recompiles the executable and re-signs, but skips the icon and plist steps.
 Since all three translation units go through one clang call, editing any one of
-them recompiles all three. `hook_png.h` is generated into `src/` and is
-gitignored. Use `make clean` for a from-scratch rebuild.
+them recompiles all three. `hook_png.h` and `maui_png.h` are generated into
+`src/` and are gitignored. Use `make clean` for a from-scratch rebuild.
 
 For console logs, run the executable inside the bundle directly instead of
 using `open`:
@@ -226,14 +229,16 @@ go_fish/
     ├── cocoa.h            # C interface exposed by cocoa.m (gf_* functions)
     ├── cocoa.m            # Cocoa: event tap, parallelized AX enumeration,
     │                      #   panel UI, status item + menu (Show Window Grid /
-    │                      #   Minimize All / Cascade All / Settings… / Quit),
+    │                      #   Minimize All / Cascade All / About… /
+    │                      #   Settings… / Quit), About window,
     │                      #   settings window (hotkey, quick-switch delay,
     │                      #   Start at boot, SEI detection, grid toggles,
     │                      #   title overrides), MRU,
     │                      #   thumbnail cache, activation, close, bulk minimize /
     │                      #   cascade, Login Items install/uninstall,
     │                      #   Secure Event Input poller + red-X icon overlay
-    └── hook.png           # menu-bar icon, embedded via xxd-generated hook_png.h
+    ├── hook.png           # menu-bar icon, embedded via xxd-generated hook_png.h
+    └── maui.png           # About-window image, embedded via maui_png.h
 ```
 
 ### Internal surface (cocoa.h / switcher.h)
@@ -315,10 +320,12 @@ The seam between the switcher state machine (`switcher.m`) and the Cocoa layer
   reports as not installed. Effective on next login; the current instance
   is left running.
 
-The menu-bar icon is embedded into the binary at build time: the `Makefile`
-runs `xxd -i hook.png` to produce `hook_png.h` (a `hook_png[]` byte array),
-which `main.m` includes and hands to `gf_run`. The resulting executable is
-fully self-contained — no asset files ship alongside it. To swap the icon,
+Both images are embedded into the binary at build time: the `Makefile` runs
+`xxd -i` over each PNG in `src/` named in `EMBED_H`, producing `hook_png.h`
+(a `hook_png[]` byte array, included by `main.m` and handed to `gf_run`) and
+`maui_png.h` (`maui_png[]`, included by `cocoa.m` for the About window). The
+resulting executable is fully self-contained — no asset files ship alongside
+it, so a loose binary run outside the `.app` still has both. To swap the icon,
 replace `hook.png` and rebuild. `cocoa.m` handles both source styles:
 
 - **Transparent-background** images (PNG with alpha) — used as-is; the

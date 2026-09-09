@@ -2,7 +2,7 @@ APP       := go_fish.app
 BIN       := $(APP)/Contents/MacOS/go_fish
 ICNS      := $(APP)/Contents/Resources/AppIcon.icns
 PLIST     := $(APP)/Contents/Info.plist
-HOOK_H    := src/hook_png.h
+EMBED_H   := src/hook_png.h src/maui_png.h
 CERT_NAME := go_fish Dev
 
 SRCS    := src/main.m src/cocoa.m src/switcher.m
@@ -59,7 +59,7 @@ $(APP): $(BIN) $(PLIST) $(ICNS)
 
 # Compile all three translation units in one clang invocation.
 # Depends on generated hook_png.h and all ObjC sources.
-$(BIN): $(SRCS) $(HOOK_H) | $(APP)/Contents/MacOS
+$(BIN): $(SRCS) $(EMBED_H) | $(APP)/Contents/MacOS
 	clang $(CFLAGS) $(FWORKS) $(SRCS) -o $@
 
 # Bundle directories are created as order-only prerequisites.
@@ -71,10 +71,11 @@ $(PLIST): src/Info.plist | $(APP)/Contents
 	mkdir -p $(APP)/Contents
 	cp $< $@
 
-# Embed hook.png as a C byte array (hook_png[] / hook_png_len).
-# xxd must run from src/ so the symbol is named from the bare filename.
-$(HOOK_H): src/hook.png
-	( cd src && xxd -i hook.png > hook_png.h )
+# Embed a PNG as a C byte array (<name>_png[] / <name>_png_len): hook.png for
+# the menu-bar icon, maui.png for the About window. xxd must run from src/ so
+# the symbol is named from the bare filename rather than the full path.
+src/%_png.h: src/%.png
+	( cd src && xxd -i $*.png > $*_png.h )
 
 # Build the .icns from hook.png via a temporary .iconset.
 $(ICNS): src/hook.png | $(APP)/Contents/Resources
@@ -107,4 +108,4 @@ $(TEST_BIN): test/switcher_test.m src/switcher.m src/switcher.h src/cocoa.h
 	clang $(CFLAGS) -framework Foundation test/switcher_test.m src/switcher.m -o $@
 
 clean:
-	rm -rf $(APP) $(HOOK_H) build
+	rm -rf $(APP) $(EMBED_H) build
