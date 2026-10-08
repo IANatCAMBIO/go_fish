@@ -54,8 +54,10 @@ make run          # or: open go_fish.app
 ```
 
 `make` compiles the Objective-C sources, generates the app icon from
-`src/hook.png`, assembles `./go_fish.app`, and signs it. Move the bundle
-wherever you like (e.g. `~/Applications`) — it's self-contained.
+`src/hook.png`, assembles `./go_fish.app`, and signs it. `make install`
+quits any running go_fish, replaces `~/Applications/go_fish.app` with the
+fresh build, and leaves it ready to launch. The bundle is self-contained, so
+you can also just move it wherever you like.
 
 Run `make cert` once to create a stable local signing certificate, so the
 Accessibility grant survives rebuilds instead of being reset by each new

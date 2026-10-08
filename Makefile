@@ -4,6 +4,7 @@ ICNS      := $(APP)/Contents/Resources/AppIcon.icns
 PLIST     := $(APP)/Contents/Info.plist
 EMBED_H   := src/hook_png.h src/maui_png.h
 CERT_NAME := go_fish Dev
+INSTALL_DIR := $(HOME)/Applications
 
 SRCS    := src/main.m src/cocoa.m src/switcher.m
 CFLAGS  := -fobjc-arc -Wall -Wno-deprecated-declarations -O2
@@ -14,7 +15,7 @@ FWORKS  := -framework Cocoa \
 
 TEST_BIN := build/switcher_test
 
-.PHONY: all clean run cert test
+.PHONY: all clean run cert test install
 
 all: $(APP)
 
@@ -96,6 +97,16 @@ $(ICNS): src/hook.png | $(APP)/Contents/Resources
 
 run: all
 	open $(APP)
+
+# Install the freshly built bundle into ~/Applications, replacing any existing
+# copy. Running instances are stopped first so the old binary isn't in use;
+# pkill -x matches the exact process name, so other processes are untouched.
+install: all
+	-pkill -x go_fish
+	mkdir -p $(INSTALL_DIR)
+	rm -rf $(INSTALL_DIR)/$(APP)
+	ditto $(APP) $(INSTALL_DIR)/$(APP)
+	@echo "Installed $(INSTALL_DIR)/$(APP)"
 
 # Switcher state-machine tests. Links the real src/switcher.m against stub
 # gf_* backend functions (test/switcher_test.m), so no AX permission, no
